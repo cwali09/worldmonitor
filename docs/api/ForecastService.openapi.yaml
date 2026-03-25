@@ -80,7 +80,10 @@ paths:
             parameters:
                 - name: runId
                   in: query
-                  description: "IMPORTANT: Currently a no-op. Always returns the latest available outcome regardless of runId. Per-run lookup is reserved for Phase 3. Check the response 'note' field when runId is supplied to detect mismatches."
+                  description: |-
+                    IMPORTANT: Currently a no-op. Always returns the latest available outcome regardless of runId.
+                     Per-run lookup is reserved for Phase 3. Check the response 'note' field when runId is supplied
+                     and you need to detect a mismatch between requested and returned run.
                   required: false
                   schema:
                     type: string
@@ -430,7 +433,10 @@ components:
             properties:
                 runId:
                     type: string
-                    description: "IMPORTANT: Currently a no-op. Always returns the latest available outcome regardless of runId. Per-run lookup is reserved for Phase 3. Check the response 'note' field when runId is supplied to detect mismatches."
+                    description: |-
+                        IMPORTANT: Currently a no-op. Always returns the latest available outcome regardless of runId.
+                         Per-run lookup is reserved for Phase 3. Check the response 'note' field when runId is supplied
+                         and you need to detect a mismatch between requested and returned run.
         GetSimulationOutcomeResponse:
             type: object
             properties:
