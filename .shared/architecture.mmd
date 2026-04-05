@@ -1,0 +1,171 @@
+%%{ init: { 'theme': 'dark' } }%%
+graph TB
+    subgraph Browser["Browser / Tauri Desktop Shell"]
+        direction TB
+        Main["main.ts<br/>Entry Point"]
+        AppClass["App.ts<br/>8-Phase Init"]
+        Main --> AppClass
+
+        subgraph Frontend["SPA Frontend (src/)"]
+            direction TB
+            subgraph Maps["Dual Map Engine"]
+                DeckGL["DeckGLMap<br/>deck.gl + maplibre-gl<br/>WebGL Flat Map"]
+                Globe["GlobeMap<br/>globe.gl 3D Globe"]
+            end
+
+            subgraph Panels["105 Panel Components"]
+                PanelBase["Panel Base Class"]
+                NewsP["NewsPanel"]
+                MarketP["MarketPanel"]
+                MonitorP["MonitorPanel"]
+                CryptoP["CryptoPanel"]
+                EconP["EconomicPanel"]
+                MilP["MilitaryPanel"]
+                OtherP["86+ More Panels..."]
+                PanelBase --> NewsP & MarketP & MonitorP & CryptoP & EconP & MilP & OtherP
+            end
+
+            subgraph AppManagers["App Orchestration (src/app/)"]
+                PanelLayout["PanelLayoutManager"]
+                DataLoader["DataLoaderManager"]
+                RefreshSched["RefreshScheduler"]
+                EventHandlers["EventHandlerManager"]
+                SearchMgr["SearchManager"]
+                CountryIntel["CountryIntelManager"]
+                DesktopUpd["DesktopUpdater"]
+            end
+
+            subgraph Workers["Web Workers"]
+                AnalysisW["analysis.worker.ts<br/>News Clustering<br/>Cross-Domain Correlation"]
+                MLWorker["ml.worker.ts<br/>ONNX Inference<br/>Embeddings, Sentiment, NER"]
+                VectorDB["vector-db.ts<br/>IndexedDB Vector Store"]
+            end
+
+            subgraph Services["Services Layer (src/services/)"]
+                Bootstrap["bootstrap.ts<br/>Two-Tier Hydration"]
+                RPC["rpc-client.ts<br/>RPC Base URL"]
+                Runtime["runtime.ts<br/>Fetch Patch (Desktop)"]
+                I18n["i18n.ts<br/>21 Languages"]
+                Correlation["correlation-engine/<br/>Multi-Domain Signals"]
+                Analytics["analytics.ts"]
+                DomainSvcs["60+ Domain Services<br/>(market, military, maritime,<br/>aviation, climate, etc.)"]
+            end
+
+            subgraph Config["Configuration (src/config/)"]
+                Variant["variant.ts<br/>5 Site Variants"]
+                VariantMeta["variant-meta.ts"]
+                FeedsCfg["feeds.ts<br/>435+ RSS Feeds"]
+                LayerDefs["map-layer-definitions.ts<br/>45 Data Layers"]
+                PanelCfg["panels.ts"]
+                MarketCfg["markets.ts"]
+            end
+
+            AppManagers --> Maps & Panels & Services
+            Services --> Workers
+            Bootstrap --> |"fetch /api/bootstrap"| EdgeFuncs
+        end
+
+        subgraph TauriShell["Tauri 2.x (src-tauri/)"]
+            RustCore["main.rs<br/>Keyring, IPC, Tray"]
+            Sidecar["sidecar/<br/>Node.js API Server<br/>Dynamic Port"]
+            RustCore --> Sidecar
+        end
+
+        Runtime --> |"Desktop: /api/* -> sidecar"| Sidecar
+    end
+
+    subgraph Middleware["Vercel Middleware"]
+        MW["middleware.ts<br/>Bot Filter, Social OG,<br/>Variant Detection"]
+    end
+
+    subgraph EdgeLayer["Vercel Edge Functions (api/)"]
+        direction TB
+        EdgeFuncs["34 Domain Endpoints"]
+        Helpers["Shared Helpers<br/>_cors.js, _rate-limit.js,<br/>_api-key.js, _relay.js"]
+
+        subgraph APIDomains["API Domains"]
+            direction LR
+            NewsAPI["news/"]
+            MarketAPI["market/"]
+            MilitaryAPI["military/"]
+            AviationAPI["aviation/"]
+            ClimateAPI["climate/"]
+            CyberAPI["cyber/"]
+            MaritimeAPI["maritime/"]
+            SeismAPI["seismology/"]
+            OtherAPI["24+ more domains..."]
+        end
+
+        EdgeFuncs --> Helpers
+        EdgeFuncs --> APIDomains
+    end
+
+    subgraph ServerLayer["Server Logic (server/)"]
+        Gateway["gateway.ts<br/>Domain Gateway Factory<br/>CORS, Auth, Rate Limit,<br/>ETag, Cache Tiers"]
+        Router["router.ts<br/>O(1) Static + Dynamic Match"]
+        DomainHandlers["worldmonitor/<br/>29 Domain Handler Dirs"]
+        SharedServer["_shared/<br/>redis.ts, rate-limit.ts,<br/>llm.ts, cache-keys.ts"]
+        Gateway --> Router --> DomainHandlers
+        DomainHandlers --> SharedServer
+    end
+
+    subgraph ProtoRPC["Proto/RPC (proto/)"]
+        ProtoDefs["Protobuf Definitions<br/>(sebuf framework)"]
+        GenClient["src/generated/client/<br/>TS RPC Client Stubs"]
+        GenServer["src/generated/server/<br/>TS Server Types"]
+        ProtoDefs --> |"buf generate"| GenClient & GenServer
+    end
+
+    subgraph Railway["Railway"]
+        AISRelay["ais-relay.cjs<br/>WebSocket AIS Proxy"]
+        SeedLoops["Seed Loops<br/>Market, Aviation, GPSJAM,<br/>Risk Scores, Positive Events"]
+        SeedScripts["seed-*.mjs<br/>Cron-based Data Ingest"]
+    end
+
+    subgraph DataStores["Data Stores"]
+        Redis["Upstash Redis<br/>Cache + Stampede Protection<br/>+ Seed Metadata"]
+        Convex["Convex Cloud<br/>Contact Form, Waitlist,<br/>Counters"]
+        IndexedDB["IndexedDB<br/>(Client-side)<br/>Persistent Cache + Vectors"]
+    end
+
+    subgraph ExternalSources["30+ Upstream Data Sources"]
+        direction LR
+        Financial["Finnhub, Yahoo,<br/>CoinGecko, FRED"]
+        Geopolitical["ACLED, UCDP,<br/>GDELT"]
+        Tracking["OpenSky, AIS,<br/>FIRMS"]
+        Infrastructure["OREF, Cloudflare,<br/>EONET"]
+        Other["Wingbits, GPSJAM,<br/>and more..."]
+    end
+
+    subgraph StaticSites["Static Content"]
+        BlogSite["blog-site/<br/>Built to public/blog/"]
+        Docs["Mintlify Docs<br/>Proxied at /docs"]
+    end
+
+    %% Connections between major groups
+    MW --> EdgeLayer
+    EdgeLayer --> ServerLayer
+    ServerLayer --> Redis
+    Sidecar --> |"Loads api/ handlers directly"| EdgeLayer
+    Railway --> Redis
+    Railway --> ExternalSources
+    ServerLayer --> ExternalSources
+    DomainSvcs --> |"fetch /api/*"| EdgeLayer
+    AppClass --> IndexedDB
+    GenClient --> |"Type-safe RPC calls"| DomainSvcs
+    GenServer --> |"Type-safe handlers"| DomainHandlers
+
+    %% Styling
+    classDef primary fill:#2563eb,stroke:#1d4ed8,color:#fff
+    classDef secondary fill:#7c3aed,stroke:#6d28d9,color:#fff
+    classDef infra fill:#059669,stroke:#047857,color:#fff
+    classDef external fill:#d97706,stroke:#b45309,color:#fff
+    classDef storage fill:#dc2626,stroke:#b91c1c,color:#fff
+
+    class Main,AppClass primary
+    class DeckGL,Globe,PanelBase secondary
+    class Gateway,Router,MW,EdgeFuncs primary
+    class Redis,Convex,IndexedDB storage
+    class Financial,Geopolitical,Tracking,Infrastructure,Other external
+    class AISRelay,SeedLoops,SeedScripts infra
+    class RustCore,Sidecar infra
