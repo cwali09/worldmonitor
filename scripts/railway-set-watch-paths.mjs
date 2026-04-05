@@ -31,6 +31,15 @@ const USES_SHARED_CONFIG = new Set([
 ]);
 
 const SERVICE_OVERRIDES = {
+  'seed-resilience-scores': {
+    watchPatterns: [
+      'scripts/seed-resilience-scores.mjs',
+      'scripts/_seed-utils.mjs',
+      'scripts/package.json',
+    ],
+    startCommand: 'node seed-resilience-scores.mjs',
+    cronSchedule: '0 */5 * * *', // every 5h — slightly inside the 6h score cache TTL
+  },
   'seed-resilience-static': {
     watchPatterns: [
       'scripts/seed-resilience-static.mjs',
@@ -89,6 +98,15 @@ const SERVICE_OVERRIDES = {
     ],
     startCommand: 'node seed-energy-intelligence.mjs',
     cronSchedule: '0 */6 * * *',
+  },
+  'seed-jodi-oil': {
+    watchPatterns: [
+      'scripts/seed-jodi-oil.mjs',
+      'scripts/_seed-utils.mjs',
+      'scripts/package.json',
+    ],
+    startCommand: 'node seed-jodi-oil.mjs',
+    cronSchedule: '0 6 25 * *',
   },
 };
 
