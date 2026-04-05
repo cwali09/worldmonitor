@@ -54,6 +54,15 @@ const SERVICE_OVERRIDES = {
     startCommand: 'node seed-owid-energy-mix.mjs',
     cronSchedule: '0 3 1 * *', // 03:00 UTC on the 1st of every month
   },
+  'seed-electricity-prices': {
+    watchPatterns: [
+      'scripts/seed-electricity-prices.mjs',
+      'scripts/_seed-utils.mjs',
+      'scripts/package.json',
+    ],
+    startCommand: 'node seed-electricity-prices.mjs',
+    cronSchedule: '0 14 * * *',
+  },
   'seed-regulatory-actions': {
     watchPatterns: [
       'scripts/seed-regulatory-actions.mjs',
@@ -62,6 +71,24 @@ const SERVICE_OVERRIDES = {
     ],
     startCommand: 'node seed-regulatory-actions.mjs',
     cronSchedule: '0 */2 * * *',
+  },
+  'seed-gas-storage-countries': {
+    watchPatterns: [
+      'scripts/seed-gas-storage-countries.mjs',
+      'scripts/_seed-utils.mjs',
+      'scripts/package.json',
+    ],
+    startCommand: 'node seed-gas-storage-countries.mjs',
+    cronSchedule: '30 10 * * *',
+  },
+  'seed-energy-intelligence': {
+    watchPatterns: [
+      'scripts/seed-energy-intelligence.mjs',
+      'scripts/_seed-utils.mjs',
+      'scripts/package.json',
+    ],
+    startCommand: 'node seed-energy-intelligence.mjs',
+    cronSchedule: '0 */6 * * *',
   },
 };
 

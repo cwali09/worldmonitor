@@ -50,6 +50,13 @@ export const HEALTH_AIR_QUALITY_KEY = 'health:air-quality:v1';
 
 export const ENERGY_MIX_KEY_PREFIX = 'energy:mix:v1:';
 export const ENERGY_EXPOSURE_INDEX_KEY = 'energy:exposure:v1:index';
+export const GAS_STORAGE_KEY_PREFIX = 'energy:gas-storage:v1:';
+export const GAS_STORAGE_COUNTRIES_KEY = 'energy:gas-storage:v1:_countries';
+export const ELECTRICITY_KEY_PREFIX = 'energy:electricity:v1:';
+export const ELECTRICITY_INDEX_KEY = 'energy:electricity:v1:index';
+export const ENERGY_INTELLIGENCE_KEY = 'energy:intelligence:v1:feed';
+export const SPR_KEY = 'economic:spr:v1';
+export const REFINERY_UTIL_KEY = 'economic:refinery-util:v1';
 
 /**
  * Static cache keys for the bootstrap endpoint.
@@ -132,7 +139,9 @@ export const BOOTSTRAP_CACHE_KEYS: Record<string, string> = {
   diseaseOutbreaks: 'health:disease-outbreaks:v1',
   economicStress:   'economic:stress-index:v1',
   faoFoodPriceIndex: 'economic:fao-ffpi:v1',
+  electricityPrices: 'energy:electricity:v1:index',
 };
+
 
 export const BOOTSTRAP_TIERS: Record<string, 'slow' | 'fast'> = {
   bisPolicy: 'slow', bisExchange: 'slow', bisCredit: 'slow',
@@ -176,4 +185,5 @@ export const BOOTSTRAP_TIERS: Record<string, 'slow' | 'fast'> = {
   diseaseOutbreaks: 'slow',
   economicStress: 'slow',
   faoFoodPriceIndex: 'slow',
+  electricityPrices: 'slow',
 };

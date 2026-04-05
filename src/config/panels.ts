@@ -83,6 +83,7 @@ const FULL_PANELS: Record<string, PanelConfig> = {
   giving: { name: 'Global Giving', enabled: false, priority: 2 },
   displacement: { name: 'UNHCR Displacement', enabled: true, priority: 2 },
   climate: { name: 'Climate Anomalies', enabled: true, priority: 2 },
+  'climate-news': { name: 'Climate News', enabled: false, priority: 2 },
   'population-exposure': { name: 'Population Exposure', enabled: true, priority: 2 },
   'security-advisories': { name: 'Security Advisories', enabled: true, priority: 2 },
   'sanctions-pressure': { name: 'Sanctions Pressure', enabled: true, priority: 2 },
@@ -1050,7 +1051,7 @@ export const PANEL_CATEGORY_MAP: Record<string, { labelKey: string; panelKeys: s
   },
   securityPolicy: {
     labelKey: 'header.panelCatSecurityPolicy',
-    panelKeys: ['security', 'policy', 'regulation'],
+    panelKeys: ['security', 'policy', 'ai-regulation'],
   },
   techMarkets: {
     labelKey: 'header.panelCatMarkets',

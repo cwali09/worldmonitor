@@ -8,6 +8,7 @@ import {
   RESILIENCE_DOMAIN_ORDER,
   getResilienceDomainWeight,
   scoreAllDimensions,
+  scoreEnergy,
 } from '../server/worldmonitor/resilience/v1/_dimension-scorers.ts';
 import { installRedis } from './helpers/fake-upstash-redis.mts';
 import { RESILIENCE_FIXTURES } from './helpers/resilience-fixtures.mts';
@@ -69,10 +70,71 @@ describe('resilience scorer contracts', () => {
     assert.deepEqual(domainAverages, {
       economic: 70.67,
       infrastructure: 77,
-      energy: 62,
+      energy: 63,
       'social-governance': 62.75,
       'health-food': 59,
     });
-    assert.equal(overallScore, 66.55);
+    assert.equal(overallScore, 66.70);
+  });
+});
+
+const DE_BASE_FIXTURES = {
+  ...RESILIENCE_FIXTURES,
+  'resilience:static:DE': {
+    iea: { energyImportDependency: { value: 65, year: 2024, source: 'IEA' } },
+  },
+  'energy:mix:v1:DE': {
+    iso2: 'DE', country: 'Germany', year: 2023,
+    coalShare: 30, gasShare: 15, oilShare: 1, renewShare: 46,
+  },
+};
+
+describe('scoreEnergy storageBuffer metric', () => {
+  it('EU country with high storage (>80% fill) contributes near-zero storageStress', async () => {
+    installRedis({
+      ...DE_BASE_FIXTURES,
+      'energy:gas-storage:v1:DE': { iso2: 'DE', fillPct: 90, trend: 'stable' },
+    });
+    const result = await scoreEnergy('DE');
+    assert.ok(result.score >= 0 && result.score <= 100, `score out of bounds: ${result.score}`);
+    assert.ok(result.coverage > 0, 'coverage should be > 0 when static data present');
+  });
+
+  it('EU country with low storage (20% fill) scores lower than with high storage', async () => {
+    installRedis({
+      ...DE_BASE_FIXTURES,
+      'energy:gas-storage:v1:DE': { iso2: 'DE', fillPct: 20, trend: 'withdrawing' },
+    });
+    const resultLow = await scoreEnergy('DE');
+
+    installRedis({
+      ...DE_BASE_FIXTURES,
+      'energy:gas-storage:v1:DE': { iso2: 'DE', fillPct: 90, trend: 'stable' },
+    });
+    const resultHigh = await scoreEnergy('DE');
+
+    assert.ok(resultLow.score < resultHigh.score, `low storage (${resultLow.score}) should score lower than high storage (${resultHigh.score})`);
+  });
+
+  it('non-EU country with no gas-storage key drops storageBuffer weight gracefully', async () => {
+    installRedis(RESILIENCE_FIXTURES);
+    const result = await scoreEnergy('US');
+    assert.ok(result.score >= 0 && result.score <= 100, `score out of bounds: ${result.score}`);
+    assert.ok(result.coverage > 0, 'coverage should be > 0 when other data is present');
+    assert.ok(result.coverage < 1, 'coverage < 1 when storageBuffer is missing');
+  });
+
+  it('EU country with null fillPct falls back gracefully (excludes storageBuffer from weighted avg)', async () => {
+    installRedis({
+      ...DE_BASE_FIXTURES,
+      'energy:gas-storage:v1:DE': { iso2: 'DE', fillPct: null },
+    });
+    const resultNull = await scoreEnergy('DE');
+
+    installRedis(DE_BASE_FIXTURES);
+    const resultMissing = await scoreEnergy('DE');
+
+    assert.ok(resultNull.score >= 0 && resultNull.score <= 100, `score out of bounds: ${resultNull.score}`);
+    assert.equal(resultNull.score, resultMissing.score, 'null fillPct should behave identically to missing key');
   });
 });

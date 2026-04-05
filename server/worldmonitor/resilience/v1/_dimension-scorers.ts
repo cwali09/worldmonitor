@@ -698,10 +698,11 @@ export async function scoreEnergy(
   countryCode: string,
   reader: ResilienceSeedReader = defaultSeedReader,
 ): Promise<ResilienceDimensionScore> {
-  const [staticRecord, energyPricesRaw, energyMixRaw] = await Promise.all([
+  const [staticRecord, energyPricesRaw, energyMixRaw, storageRaw] = await Promise.all([
     readStaticCountry(countryCode, reader),
     reader(RESILIENCE_ENERGY_PRICES_KEY),
     reader(`${RESILIENCE_ENERGY_MIX_KEY_PREFIX}${countryCode}`),
+    reader(`energy:gas-storage:v1:${countryCode}`),
   ]);
 
   const mix = energyMixRaw != null && typeof energyMixRaw === 'object'
@@ -714,12 +715,23 @@ export async function scoreEnergy(
   const renewShare  = mix && typeof mix.renewShare === 'number' ? mix.renewShare : null;
   const energyStress = getEnergyPriceStress(energyPricesRaw);
 
+  const storageFillPct = storageRaw != null && typeof storageRaw === 'object'
+    ? (() => {
+        const raw = (storageRaw as Record<string, unknown>).fillPct;
+        return raw != null ? safeNum(raw) : null;
+      })()
+    : null;
+  const storageStress = storageFillPct != null
+    ? Math.min(1, Math.max(0, (80 - storageFillPct) / 80))
+    : null;
+
   return weightedBlend([
-    { score: dependency  == null ? null : normalizeLowerBetter(dependency, 0, 100),   weight: 0.35 },
-    { score: gasShare    == null ? null : normalizeLowerBetter(gasShare, 0, 100),     weight: 0.20 },
-    { score: coalShare   == null ? null : normalizeLowerBetter(coalShare, 0, 100),    weight: 0.15 },
-    { score: renewShare  == null ? null : normalizeHigherBetter(renewShare, 0, 100),  weight: 0.20 },
-    { score: energyStress == null ? null : normalizeLowerBetter(energyStress, 0, 25), weight: 0.10 },
+    { score: dependency    == null ? null : normalizeLowerBetter(dependency, 0, 100),        weight: 0.30 },
+    { score: gasShare      == null ? null : normalizeLowerBetter(gasShare, 0, 100),          weight: 0.20 },
+    { score: coalShare     == null ? null : normalizeLowerBetter(coalShare, 0, 100),         weight: 0.15 },
+    { score: renewShare    == null ? null : normalizeHigherBetter(renewShare, 0, 100),       weight: 0.15 },
+    { score: storageStress == null ? null : normalizeLowerBetter(storageStress * 100, 0, 100), weight: 0.10 },
+    { score: energyStress  == null ? null : normalizeLowerBetter(energyStress, 0, 25),       weight: 0.10 },
   ]);
 }
 
