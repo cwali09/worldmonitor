@@ -240,10 +240,28 @@ function validate(data) {
   return Array.isArray(data?.events) && data.events.length >= 1;
 }
 
+export function declareRecords(data) {
+  return Array.isArray(data?.events) ? data.events.length : 0;
+}
+
 runSeed('conflict', 'iran-events', CANONICAL_KEY, fetchIranEvents, {
   validateFn: validate,
-  ttlSeconds: 172800,
+  // 14d canonical TTL == maxStaleMin (20160 min = 14d). This is a MANUALLY
+  // re-seeded source (operator runs the script ~weekly when LiveUAMap has
+  // fresh events); pre-fix the canonical TTL was 2 days while the
+  // health-tolerance was 14 days, so any operator-cadence delay >2d left
+  // the canonical TTL'd-out while seed-meta survived. Health then reported
+  // `iranEvents: EMPTY records=0` while seed-meta still showed last-good
+  // recordCount. Symptom on WM 2026-05-08: last manual seed 2.7d ago
+  // (within tolerance), but canonical missing → CRIT in /api/health.
+  // Bumping canonical TTL to match maxStaleMin keeps the canonical alive
+  // for the full health-tolerance window. Same trap family as BIS PR #3610.
+  ttlSeconds: 1209600,     // 14 days = 14 * 24 * 3600
   sourceVersion: 'liveuamap-manual-v1',
+
+  declareRecords,
+  schemaVersion: 1,
+  maxStaleMin: 20160,
 }).catch((err) => {
   const _cause = err.cause ? ` (cause: ${err.cause.message || err.cause.code || err.cause})` : ''; console.error('FATAL:', (err.message || err) + _cause);
   process.exit(0);

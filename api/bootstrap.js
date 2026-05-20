@@ -3,6 +3,7 @@ import { validateApiKey } from './_api-key.js';
 import { jsonResponse } from './_json-response.js';
 // @ts-expect-error — JS module, no declaration file
 import { redisPipeline } from './_upstash-json.js';
+import { unwrapEnvelope } from './_seed-envelope.js';
 
 export const config = { runtime: 'edge' };
 
@@ -14,15 +15,32 @@ const BOOTSTRAP_CACHE_KEYS = {
   trafficAnomalies: 'cf:radar:traffic-anomalies:v1',
   marketQuotes:     'market:stocks-bootstrap:v1',
   commodityQuotes:  'market:commodities-bootstrap:v1',
-  sectors:          'market:sectors:v1',
+  sectors:          'market:sectors:v2',
   etfFlows:         'market:etf-flows:v1',
   macroSignals:     'economic:macro-signals:v1',
   bisPolicy:        'economic:bis:policy:v1',
   bisExchange:      'economic:bis:eer:v1',
   bisCredit:        'economic:bis:credit:v1',
+  bisDsr:           'economic:bis:dsr:v1',
+  bisPropertyResidential: 'economic:bis:property-residential:v1',
+  bisPropertyCommercial:  'economic:bis:property-commercial:v1',
+  imfMacro:         'economic:imf:macro:v2',
+  imfGrowth:        'economic:imf:growth:v1',
+  imfLabor:         'economic:imf:labor:v1',
+  imfExternal:      'economic:imf:external:v1',
+  // plan 2026-04-25-004 Phase 2 (financialSystemExposure data keys):
+  // intentionally NOT added here. The 3 new keys
+  // (economic:wb-external-debt:v1, economic:bis-lbs:v1,
+  //  economic:fatf-listing:v1) are SERVER-ONLY inputs to
+  // scoreFinancialSystemExposure — no client-side panel consumes them
+  // directly. AGENTS.md's "new data sources must hydrate via bootstrap"
+  // applies to keys with `getHydratedData` consumers in src/; the
+  // bootstrap-key-hydration-coverage test enforces that invariant. If
+  // a future PR adds a client panel that displays raw BIS LBS / FATF /
+  // WB external-debt data, register the keys here AND add the
+  // corresponding consumer + cache-keys.ts entries in the same PR.
   shippingRates:    'supply_chain:shipping:v2',
   chokepoints:      'supply_chain:chokepoints:v4',
-  chokepointTransits: 'supply_chain:chokepoint_transits:v1',
   minerals:         'supply_chain:minerals:v2',
   giving:           'giving:summary:v1',
   climateAnomalies: 'climate:anomalies:v2',
@@ -40,9 +58,9 @@ const BOOTSTRAP_CACHE_KEYS = {
   renewableEnergy:  'economic:worldbank-renewable:v1',
   positiveGeoEvents: 'positive_events:geo-bootstrap:v1',
   theaterPosture: 'theater_posture:sebuf:stale:v1',
-  riskScores: 'risk:scores:sebuf:stale:v1',
+  riskScores: 'risk:scores:sebuf:stale:v2',
   naturalEvents: 'natural:events:v1',
-  flightDelays: 'aviation:delays-bootstrap:v1',
+  flightDelays: 'aviation:delays-bootstrap:v2',
   insights: 'news:insights:v1',
   predictions: 'prediction:markets-bootstrap:v1',
   cryptoQuotes:     'market:crypto:v1',
@@ -76,23 +94,44 @@ const BOOTSTRAP_CACHE_KEYS = {
   nationalDebt:      'economic:national-debt:v1',
   euGasStorage:      'economic:eu-gas-storage:v1',
   eurostatCountryData: 'economic:eurostat-country-data:v1',
+  eurostatHousePrices: 'economic:eurostat:house-prices:v1',
+  eurostatGovDebtQ:    'economic:eurostat:gov-debt-q:v1',
+  eurostatIndProd:     'economic:eurostat:industrial-production:v1',
   marketImplications: 'intelligence:market-implications:v1',
   fearGreedIndex:    'market:fear-greed:v1',
+  hyperliquidFlow:   'market:hyperliquid:flow:v1',
   crudeInventories:  'economic:crude-inventories:v1',
   natGasStorage:     'economic:nat-gas-storage:v1',
   ecbFxRates:        'economic:ecb-fx-rates:v1',
   euFsi:             'economic:fsi-eu:v1',
   shippingStress:    'supply_chain:shipping_stress:v1',
   socialVelocity:    'intelligence:social:reddit:v1',
+  wsbTickers:        'intelligence:wsb-tickers:v1',
   pizzint:           'intelligence:pizzint:seed:v1',
   diseaseOutbreaks:  'health:disease-outbreaks:v1',
   economicStress:    'economic:stress-index:v1',
-  electricityPrices: 'energy:electricity:v1:index',
-  jodiOil:           'energy:jodi-oil:v1:_countries',
+  electricityPrices:    'energy:electricity:v1:index',
+  jodiOil:              'energy:jodi-oil:v1:_countries',
+  chokepointBaselines:  'energy:chokepoint-baselines:v1',
+  portwatchChokepointsRef: 'portwatch:chokepoints:ref:v1',
+  portwatchPortActivity: 'supply_chain:portwatch-ports:v1:_countries',
+  oilStocksAnalysis:    'energy:oil-stocks-analysis:v1',
+  lngVulnerability:     'energy:lng-vulnerability:v1',
+  sprPolicies:          'energy:spr-policies:v1',
+  pipelinesGas:         'energy:pipelines:gas:v1',
+  pipelinesOil:         'energy:pipelines:oil:v1',
+  storageFacilities:    'energy:storage-facilities:v1',
+  fuelShortages:        'energy:fuel-shortages:v1',
+  energyDisruptions:    'energy:disruptions:v1',
+  energyCrisisPolicies: 'energy:crisis-policies:v1',
+  aaiiSentiment:        'market:aaii-sentiment:v1',
+  breadthHistory:       'market:breadth-history:v1',
 };
 
 const SLOW_KEYS = new Set([
-  'bisPolicy', 'bisExchange', 'bisCredit', 'minerals', 'giving',
+  'bisPolicy', 'bisExchange', 'bisCredit',
+  'bisDsr', 'bisPropertyResidential', 'bisPropertyCommercial',
+  'imfMacro', 'imfGrowth', 'imfLabor', 'imfExternal', 'minerals', 'giving',
   'sectors', 'etfFlows', 'wildfires', 'climateAnomalies', 'climateDisasters', 'co2Monitoring', 'oceanIce', 'climateNews',
   'radiationWatch', 'thermalEscalation', 'crossSourceSignals',
   'cyberThreats', 'techReadiness', 'progressData', 'renewableEnergy',
@@ -111,8 +150,12 @@ const SLOW_KEYS = new Set([
   'nationalDebt',
   'euGasStorage',
   'eurostatCountryData',
+  'eurostatHousePrices',
+  'eurostatGovDebtQ',
+  'eurostatIndProd',
   'marketImplications',
   'fearGreedIndex',
+  'hyperliquidFlow',
   'crudeInventories',
   'natGasStorage',
   'ecbFxRates',
@@ -122,12 +165,26 @@ const SLOW_KEYS = new Set([
   'pizzint',
   'electricityPrices',
   'jodiOil',
+  'chokepointBaselines',
+  'portwatchChokepointsRef',
+  'portwatchPortActivity',
+  'oilStocksAnalysis',
+  'lngVulnerability',
+  'sprPolicies',
+  'pipelinesGas',
+  'pipelinesOil',
+  'storageFacilities',
+  'fuelShortages',
+  'energyDisruptions',
+  'energyCrisisPolicies',
+  'aaiiSentiment',
+  'breadthHistory',
 ]);
 const FAST_KEYS = new Set([
-  'earthquakes', 'outages', 'serviceStatuses', 'ddosAttacks', 'trafficAnomalies', 'macroSignals', 'chokepoints', 'chokepointTransits',
+  'earthquakes', 'outages', 'serviceStatuses', 'ddosAttacks', 'trafficAnomalies', 'macroSignals', 'chokepoints',
   'marketQuotes', 'commodityQuotes', 'positiveGeoEvents', 'riskScores', 'flightDelays','insights', 'predictions',
   'iranEvents', 'temporalAnomalies', 'weatherAlerts', 'spending', 'theaterPosture', 'gdeltIntel',
-  'correlationCards', 'forecasts', 'shippingRates', 'shippingStress', 'socialVelocity',
+  'correlationCards', 'forecasts', 'shippingRates', 'shippingStress', 'socialVelocity', 'wsbTickers',
 ]);
 
 // No public/s-maxage: CF (in front of api.worldmonitor.app) ignores Vary: Origin and would
@@ -160,7 +217,11 @@ async function getCachedJsonBatch(keys) {
     if (raw) {
       try {
         const parsed = JSON.parse(raw);
-        if (parsed !== NEG_SENTINEL) result.set(keys[i], parsed);
+        if (parsed === NEG_SENTINEL) continue;
+        // Envelope-aware: bootstrap is a public-boundary consumer — strip _seed
+        // from contract-mode canonical keys so clients never see envelope
+        // metadata. Legacy bare-shape values pass through unchanged.
+        result.set(keys[i], unwrapEnvelope(parsed).data);
       } catch { /* skip malformed */ }
     }
   }
@@ -175,7 +236,7 @@ export default async function handler(req) {
   if (req.method === 'OPTIONS')
     return new Response(null, { status: 204, headers: cors });
 
-  const apiKeyResult = validateApiKey(req);
+  const apiKeyResult = await validateApiKey(req);
   if (apiKeyResult.required && !apiKeyResult.valid)
     return jsonResponse({ error: apiKeyResult.error }, 401, cors);
 

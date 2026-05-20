@@ -6,15 +6,19 @@ import type { MarketData } from '@/types';
 import type { TimeRange } from '@/components';
 import {
   FEEDS,
+  CANONICAL_FEEDS,
   INTEL_SOURCES,
   SECTORS,
   COMMODITIES,
   MARKET_SYMBOLS,
   SITE_VARIANT,
   LAYER_TO_SOURCE,
+  isPanelInVariantDefaults,
 } from '@/config';
+import { resolveNewsCategories, enabledNewsCategoryKeys } from '@/config/feed-resolution';
 import { INTEL_HOTSPOTS, CONFLICT_ZONES } from '@/config/geo';
 import { tokenizeForMatch, matchKeyword } from '@/utils/keyword-match';
+import { withTimeout } from '@/utils/with-timeout';
 import {
   fetchCategoryFeeds,
   getFeedFailures,
@@ -61,6 +65,8 @@ import {
   fetchCrudeInventoriesRpc,
   fetchNatGasStorageRpc,
   getEuGasStorageData,
+  getOilStocksAnalysisData,
+  fetchLngVulnerability,
   getEcbFxRatesData,
   fetchBisData,
   fetchBlsData,
@@ -79,12 +85,14 @@ import {
   fetchRadiationWatch,
 } from '@/services';
 import { getMarketWatchlistEntries } from '@/services/market-watchlist';
-import { fetchStockAnalysesForTargets, getStockAnalysisTargets } from '@/services/stock-analysis';
+import { fetchStockAnalysesForTargets, getStockAnalysisTargets, type StockAnalysisResult } from '@/services/stock-analysis';
+import { fetchInsiderTransactions } from '@/services/insider-transactions';
 import {
   fetchStockBacktestsForTargets,
   fetchStoredStockBacktests,
   getMissingOrStaleStoredStockBacktests,
   hasFreshStoredStockBacktests,
+  type StockBacktestResult,
 } from '@/services/stock-backtest';
 import {
   fetchStockAnalysisHistory,
@@ -92,6 +100,7 @@ import {
   hasFreshStockAnalysisHistory,
   getLatestStockAnalysisSnapshots,
   mergeStockAnalysisHistory,
+  type StockAnalysisHistory,
 } from '@/services/stock-analysis-history';
 import { checkBatchForBreakingAlerts, dispatchOrefBreakingAlert } from '@/services/breaking-news-alerts';
 import { mlWorker } from '@/services/ml-worker';
@@ -128,6 +137,7 @@ import { getHydratedData } from '@/services/bootstrap';
 import { ingestHeadlines } from '@/services/trending-keywords';
 import type { ListFeedDigestResponse } from '@/generated/client/worldmonitor/news/v1/service_client';
 import type { GetSectorSummaryResponse, ListMarketQuotesResponse, ListCommodityQuotesResponse } from '@/generated/client/worldmonitor/market/v1/service_client';
+import type { SectorValuation } from '@/components/MarketPanel';
 import { mountCommunityWidget } from '@/components/CommunityWidget';
 import { ResearchServiceClient } from '@/generated/client/worldmonitor/research/v1/service_client';
 import {
@@ -155,6 +165,9 @@ import {
   SupplyChainPanel,
   DiseaseOutbreaksPanel,
   SocialVelocityPanel,
+  WsbTickerScannerPanel,
+  AAIISentimentPanel,
+  MarketBreadthPanel,
 } from '@/components';
 import { SatelliteFiresPanel } from '@/components/SatelliteFiresPanel';
 import { classifyNewsItem } from '@/services/positive-classifier';
@@ -234,6 +247,11 @@ function protoItemToNewsItem(p: ProtoNewsItem): NewsItem {
     ...(p.location && { lat: p.location.latitude, lon: p.location.longitude }),
     ...(p.importanceScore ? { importanceScore: p.importanceScore } : {}),
     ...(p.corroborationCount ? { corroborationCount: p.corroborationCount } : {}),
+    // Cleaned RSS description (U3 proto field 12). Only populated when the
+    // upstream feed carried a usable <description>/<content:encoded>/<summary>;
+    // empty string otherwise. Consumers render the headline and fall back to
+    // snippet as a secondary line when non-empty.
+    ...(p.snippet ? { snippet: p.snippet } : {}),
   };
 }
 
@@ -270,6 +288,7 @@ export class DataLoaderManager implements AppModule {
   private boundMarketWatchlistHandler: (() => void) | null = null;
   private satellitePropagationCleanup: (() => void) | null = null;
   private dailyBriefGeneration = 0;
+  private _stockAnalysisGeneration = 0;
   private dailyBriefFrameworkUnsubscribe: (() => void) | null = null;
   private marketImplicationsFrameworkUnsubscribe: (() => void) | null = null;
   private cachedSatRecs: SatRecEntry[] | null = null;
@@ -462,8 +481,8 @@ export class DataLoaderManager implements AppModule {
         tasks.push({ name: 'oil', task: runGuarded('oil', () => this.loadOilAnalytics()) });
       }
 
-      // Trade policy data (FULL and FINANCE only)
-      if (SITE_VARIANT === 'full' || SITE_VARIANT === 'finance' || SITE_VARIANT === 'commodity') {
+      // Trade policy + supply-chain data (FULL, FINANCE, COMMODITY, ENERGY variants use supply-chain surface)
+      if (SITE_VARIANT === 'full' || SITE_VARIANT === 'finance' || SITE_VARIANT === 'commodity' || SITE_VARIANT === 'energy') {
         if (shouldLoad('trade-policy')) {
           tasks.push({ name: 'tradePolicy', task: runGuarded('tradePolicy', () => this.loadTradePolicy()) });
         }
@@ -487,12 +506,6 @@ export class DataLoaderManager implements AppModule {
           task: runGuarded('species', () => this.loadSpeciesData()),
         });
       }
-      if (shouldLoad('renewable')) {
-        tasks.push({
-          name: 'renewable',
-          task: runGuarded('renewable', () => this.loadRenewableData()),
-        });
-      }
       tasks.push({
         name: 'happinessMap',
         task: runGuarded('happinessMap', async () => {
@@ -506,6 +519,14 @@ export class DataLoaderManager implements AppModule {
           const installations = await fetchRenewableInstallations();
           this.ctx.map?.setRenewableInstallations(installations);
         }),
+      });
+    }
+
+    // Renewable panel is shared by happy and energy variants.
+    if (shouldLoad('renewable')) {
+      tasks.push({
+        name: 'renewable',
+        task: runGuarded('renewable', () => this.loadRenewableData()),
       });
     }
 
@@ -546,6 +567,7 @@ export class DataLoaderManager implements AppModule {
     if (this.ctx.mapLayers.natural) tasks.push({ name: 'natural', task: runGuarded('natural', () => this.loadNatural()) });
     if (this.ctx.mapLayers.diseaseOutbreaks || shouldLoad('disease-outbreaks')) tasks.push({ name: 'diseaseOutbreaks', task: runGuarded('diseaseOutbreaks', () => this.loadDiseaseOutbreaks()) });
     if (shouldLoad('social-velocity')) tasks.push({ name: 'socialVelocity', task: runGuarded('socialVelocity', () => this.loadSocialVelocity()) });
+    if (hasPremiumAccess() && shouldLoad('wsb-ticker-scanner')) tasks.push({ name: 'wsbTickers', task: runGuarded('wsbTickers', () => this.loadWsbTickers()) });
     if (shouldLoad('economic')) tasks.push({ name: 'economicStress', task: runGuarded('economicStress', () => this.loadEconomicStress()) });
     if (SITE_VARIANT !== 'happy' && this.ctx.mapLayers.weather) tasks.push({ name: 'weather', task: runGuarded('weather', () => this.loadWeatherAlerts()) });
     if (SITE_VARIANT !== 'happy' && !isDesktopRuntime() && this.ctx.mapLayers.ais) tasks.push({ name: 'ais', task: runGuarded('ais', () => this.loadAisSignals()) });
@@ -572,7 +594,13 @@ export class DataLoaderManager implements AppModule {
       tasks.push({ name: 'radiation', task: runGuarded('radiation', () => this.loadRadiationWatch()) });
     }
 
-    if (SITE_VARIANT !== 'happy') {
+    // tech-readiness is only seeded on full + tech variants (api/bootstrap.js +
+    // scripts/seed-wb-indicators.mjs); on commodity/finance/energy the 5s fetch
+    // at services/economic/index.ts:694 just times out. shouldLoad() alone is
+    // not enough — loadAllData(true) on boot (App.ts:1226) bypasses the viewport
+    // check via forceAll. Gate on variant defaults so this only fires where the
+    // seed actually exists.
+    if (isPanelInVariantDefaults('tech-readiness') && shouldLoad('tech-readiness')) {
       tasks.push({ name: 'techReadiness', task: runGuarded('techReadiness', () => (this.ctx.panels['tech-readiness'] as TechReadinessPanel)?.refresh()) });
     }
     if (SITE_VARIANT !== 'happy' && shouldLoad('thermal-escalation')) {
@@ -867,7 +895,11 @@ export class DataLoaderManager implements AppModule {
     this.applyTimeRangeFilterToNewsPanelsDebounced();
   }
 
-  private async loadNewsCategory(category: string, feeds: typeof FEEDS.politics, digest?: ListFeedDigestResponse | null): Promise<NewsItem[]> {
+  // `isCustom` marks a category from a user-added panel that isn't in the
+  // active variant's preset. The per-variant server digest never carries it,
+  // so it skips the digest-availability gate and fetches its full feed set
+  // directly client-side (the cost is borne only by users who customize).
+  private async loadNewsCategory(category: string, feeds: typeof FEEDS.politics, digest?: ListFeedDigestResponse | null, isCustom = false): Promise<NewsItem[]> {
     try {
       const panel = this.ctx.newsPanels[category];
 
@@ -950,8 +982,15 @@ export class DataLoaderManager implements AppModule {
         }
       };
 
+      // Preset categories: serve last-known-good while the digest is briefly
+      // unavailable. Custom categories are NEVER in the digest, so this branch
+      // would fire on every refresh after the first load — getStaleNewsItems
+      // reads ctx.newsByCategory, which the prior cycle's direct fetch already
+      // populated — and freeze the panel on stale headlines. Skip it for them
+      // and fall through to the direct fetch; the panel keeps showing its
+      // current batch until fresh data lands (no blank flash).
       const staleItems = this.getStaleNewsItems(category).filter(i => enabledNames.has(i.source));
-      if (staleItems.length > 0) {
+      if (!isCustom && staleItems.length > 0) {
         console.warn(`[News] Digest missing for "${category}", serving stale headlines (${staleItems.length})`);
         this.renderNewsForCategory(category, staleItems);
         this.ctx.statusPanel?.updateFeed(category.charAt(0).toUpperCase() + category.slice(1), {
@@ -961,7 +1000,11 @@ export class DataLoaderManager implements AppModule {
         return staleItems;
       }
 
-      if (!this.isPerFeedFallbackEnabled()) {
+      // The per-feed-fallback flag throttles the digest-down thundering herd
+      // (every preset category fetching at once). It does NOT apply to custom
+      // categories: those are NEVER in the digest by design — direct fetch is
+      // their only path, and there are only a handful of them per user.
+      if (!isCustom && !this.isPerFeedFallbackEnabled()) {
         console.warn(`[News] Digest missing for "${category}", limited per-feed fallback disabled`);
         this.renderNewsForCategory(category, []);
         this.ctx.statusPanel?.updateFeed(category.charAt(0).toUpperCase() + category.slice(1), {
@@ -971,8 +1014,14 @@ export class DataLoaderManager implements AppModule {
         return [];
       }
 
-      const fallbackFeeds = this.selectLimitedFeeds(enabledFeeds, this.perFeedFallbackCategoryFeedLimit);
-      if (fallbackFeeds.length < enabledFeeds.length) {
+      // Custom categories fetch their full feed set (no thundering-herd risk);
+      // preset categories stay capped by perFeedFallbackCategoryFeedLimit.
+      const fallbackFeeds = isCustom
+        ? enabledFeeds
+        : this.selectLimitedFeeds(enabledFeeds, this.perFeedFallbackCategoryFeedLimit);
+      if (isCustom) {
+        console.warn(`[News] Custom category "${category}" (not in variant preset), fetching ${fallbackFeeds.length} feeds directly`);
+      } else if (fallbackFeeds.length < enabledFeeds.length) {
         console.warn(`[News] Digest missing for "${category}", using limited per-feed fallback (${fallbackFeeds.length}/${enabledFeeds.length} feeds)`);
       } else {
         console.warn(`[News] Digest missing for "${category}", using per-feed fallback (${fallbackFeeds.length} feeds)`);
@@ -1038,9 +1087,16 @@ export class DataLoaderManager implements AppModule {
     // Fire digest fetch early (non-blocking) — await before category loop
     const digestPromise = this.tryFetchDigest();
 
-    const categories = Object.entries(FEEDS)
-      .filter((entry): entry is [string, typeof FEEDS[keyof typeof FEEDS]] => Array.isArray(entry[1]) && entry[1].length > 0)
-      .map(([key, feeds]) => ({ key, feeds }));
+    // Panel-driven, not variant-driven: load the active variant's preset
+    // categories PLUS any extra categories required by enabled news panels the
+    // user added beyond the preset (e.g. Tech panels customized into `full`).
+    // Custom categories aren't in the per-variant server digest, so they're
+    // flagged `isCustom` and fetched directly client-side in loadNewsCategory().
+    const categories = resolveNewsCategories(
+      FEEDS,
+      CANONICAL_FEEDS,
+      enabledNewsCategoryKeys(this.ctx.newsPanels, this.ctx.panels, this.ctx.panelSettings),
+    );
 
     const digest = await digestPromise;
 
@@ -1050,7 +1106,7 @@ export class DataLoaderManager implements AppModule {
     for (let i = 0; i < categories.length; i += categoryConcurrency) {
       const chunk = categories.slice(i, i + categoryConcurrency);
       const chunkResults = await Promise.allSettled(
-        chunk.map(({ key, feeds }) => this.loadNewsCategory(key, feeds, digest))
+        chunk.map(({ key, feeds, isCustom }) => this.loadNewsCategory(key, feeds, digest, isCustom))
       );
       categoryResults.push(...chunkResults);
     }
@@ -1200,16 +1256,32 @@ export class DataLoaderManager implements AppModule {
     const panel = this.ctx.panels['stock-analysis'] as StockAnalysisPanel | undefined;
     if (!panel) return;
 
+    // Bump generation so any in-flight insider fetch from a prior invocation
+    // of loadStockAnalysis no-ops instead of re-rendering stale snapshots on
+    // top of the current render.
+    const generation = ++this._stockAnalysisGeneration;
+
     try {
       const targets = getStockAnalysisTargets();
       const targetSymbols = targets.map((target) => target.symbol);
       const storedHistory = await fetchStockAnalysisHistory(targets.length);
       const cachedSnapshots = getLatestStockAnalysisSnapshots(storedHistory, targets.length);
+      const historyIsFresh = hasFreshStockAnalysisHistory(storedHistory, targetSymbols);
+
       if (cachedSnapshots.length > 0) {
         panel.renderAnalyses(cachedSnapshots, storedHistory, 'cached');
       }
 
-      if (hasFreshStockAnalysisHistory(storedHistory, targetSymbols)) {
+      if (historyIsFresh) {
+        // No live fetch coming — safe to enrich the cached render with
+        // insiders now. This is the only cached-path insider fetch; when a
+        // live fetch is about to run we defer insider enrichment until after
+        // the live render so we never re-render stale cached snapshots over
+        // fresh live data.
+        if (cachedSnapshots.length > 0) {
+          void this.loadInsiderDataForPanel(panel, targetSymbols, cachedSnapshots, storedHistory, 'cached', generation)
+            .catch((error) => console.error('[StockAnalysis] insider fetch failed:', error));
+        }
         return;
       }
 
@@ -1219,11 +1291,34 @@ export class DataLoaderManager implements AppModule {
       if (results.length === 0) {
         if (cachedSnapshots.length === 0) {
           panel.showRetrying('Stock analysis is waiting for eligible watchlist symbols.');
+          return;
         }
+        // Live fetch returned nothing but we already rendered cachedSnapshots
+        // above. Enrich the displayed cached snapshots with insider data so
+        // the user still sees the insider section.
+        void this.loadInsiderDataForPanel(panel, targetSymbols, cachedSnapshots, storedHistory, 'cached', generation)
+          .catch((error) => console.error('[StockAnalysis] insider fetch failed:', error));
         return;
       }
       const nextHistory = mergeStockAnalysisHistory(storedHistory, results);
-      panel.renderAnalyses(results, nextHistory, 'live');
+      // Build a combined view so a partial refetch does not shrink the panel:
+      // preserve still-fresh cached snapshots for symbols we did NOT refetch,
+      // and use live results for symbols we did. Watchlist order is preserved.
+      const resultBySymbol = new Map(results.map((r) => [r.symbol, r]));
+      const combined: StockAnalysisResult[] = [];
+      for (const target of targets) {
+        const live = resultBySymbol.get(target.symbol);
+        if (live) {
+          combined.push(live);
+          continue;
+        }
+        const cached = storedHistory[target.symbol]?.[0];
+        if (cached?.available) combined.push(cached);
+      }
+      const snapshotsToRender = combined.length > 0 ? combined : results;
+      panel.renderAnalyses(snapshotsToRender, nextHistory, 'live');
+      void this.loadInsiderDataForPanel(panel, targetSymbols, snapshotsToRender, nextHistory, 'live', generation)
+        .catch((error) => console.error('[StockAnalysis] insider fetch failed:', error));
     } catch (error) {
       console.error('[StockAnalysis] failed:', error);
       const cachedHistory = await fetchStockAnalysisHistory().catch(() => ({}));
@@ -1234,6 +1329,34 @@ export class DataLoaderManager implements AppModule {
       }
       panel.showError('Premium stock analysis is temporarily unavailable.');
     }
+  }
+
+  private async loadInsiderDataForPanel(
+    panel: StockAnalysisPanel,
+    symbols: string[],
+    snapshotsToReRender: StockAnalysisResult[],
+    historyForReRender: StockAnalysisHistory,
+    source: 'live' | 'cached',
+    generation: number,
+  ): Promise<void> {
+    const results = await Promise.allSettled(symbols.map(s => fetchInsiderTransactions(s)));
+    // If another loadStockAnalysis invocation has started while this fetch
+    // was in flight, drop the result entirely — both setInsiderData and the
+    // re-render would clobber the current state.
+    if (generation !== this._stockAnalysisGeneration) return;
+    for (let i = 0; i < symbols.length; i++) {
+      const r = results[i];
+      if (r && r.status === 'fulfilled') {
+        panel.setInsiderData(symbols[i]!, r.value);
+      } else {
+        panel.setInsiderData(symbols[i]!, { unavailable: true, symbol: symbols[i]!, totalBuys: 0, totalSells: 0, netValue: 0, transactions: [], fetchedAt: '' });
+      }
+    }
+    // Re-render the panel so the insider section becomes visible now that
+    // setInsiderData has populated insiderBySymbol. Guard once more in case
+    // something awaited between the setInsiderData calls above.
+    if (generation !== this._stockAnalysisGeneration) return;
+    panel.renderAnalyses(snapshotsToReRender, historyForReRender, source);
   }
 
   async loadStockBacktest(): Promise<void> {
@@ -1260,7 +1383,22 @@ export class DataLoaderManager implements AppModule {
         }
         return;
       }
-      panel.renderBacktests(results);
+      // Build a combined view so a partial refetch does not shrink the panel:
+      // keep still-fresh cached backtests for symbols we did NOT refetch, swap
+      // in live results for the ones we did. Watchlist order is preserved.
+      const resultBySymbol = new Map(results.map((r) => [r.symbol, r]));
+      const storedBySymbol = new Map(stored.map((s) => [s.symbol, s]));
+      const combined: StockBacktestResult[] = [];
+      for (const target of targets) {
+        const live = resultBySymbol.get(target.symbol);
+        if (live) {
+          combined.push(live);
+          continue;
+        }
+        const cached = storedBySymbol.get(target.symbol);
+        if (cached) combined.push(cached);
+      }
+      panel.renderBacktests(combined.length > 0 ? combined : results);
     } catch (error) {
       console.error('[StockBacktest] failed:', error);
       const stored = await fetchStoredStockBacktests().catch(() => []);
@@ -1334,7 +1472,7 @@ export class DataLoaderManager implements AppModule {
       }
 
       // Sector heatmap: always attempt loading regardless of market rate-limit status
-      const hydratedSectors = getHydratedData('sectors') as GetSectorSummaryResponse | undefined;
+      const hydratedSectors = getHydratedData('sectors') as (GetSectorSummaryResponse & { valuations?: Record<string, SectorValuation> }) | undefined;
       const heatmapPanel = this.ctx.panels['heatmap'] as HeatmapPanel | undefined;
       const sectorNameMap = new Map(SECTORS.map((s) => [s.symbol, s.name]));
       const toHeatmapItem = (s: { symbol: string; name: string; change: number }) => ({
@@ -1344,17 +1482,37 @@ export class DataLoaderManager implements AppModule {
       });
       const toSectorBar = (s: { symbol?: string; name: string; change: number | null }) =>
         s.symbol && Number.isFinite(s.change) ? { symbol: s.symbol, name: s.name, change1d: s.change as number } : null;
-      if (hydratedSectors?.sectors?.length) {
+      // Defensive: a pre-PR bootstrap payload may have `sectors` but lack the
+      // new `valuations` field entirely. Treat that shape as a cache miss and
+      // fall through to a live fetch so the valuations tab can populate.
+      const hydratedHasValuationsField = hydratedSectors
+        ? Object.prototype.hasOwnProperty.call(hydratedSectors, 'valuations')
+        : false;
+      if (hydratedSectors?.sectors?.length && hydratedHasValuationsField) {
         warmSectorCache(hydratedSectors);
         const items = hydratedSectors.sectors.map(toHeatmapItem);
         const sectorBars = items.map(toSectorBar).filter((s): s is NonNullable<typeof s> => s !== null);
         heatmapPanel?.renderHeatmap(items, sectorBars.length ? sectorBars : undefined);
+        heatmapPanel?.updateValuations(hydratedSectors.valuations);
       } else {
-        const sectorsResp = await fetchSectors();
+        // If hydrated had sectors but no valuations field, render performance
+        // tiles immediately so users see heatmap data while the live fetch runs.
+        if (hydratedSectors?.sectors?.length) {
+          const items = hydratedSectors.sectors.map(toHeatmapItem);
+          const sectorBars = items.map(toSectorBar).filter((s): s is NonNullable<typeof s> => s !== null);
+          heatmapPanel?.renderHeatmap(items, sectorBars.length ? sectorBars : undefined);
+        }
+        const sectorsResp = await fetchSectors() as GetSectorSummaryResponse & { valuations?: Record<string, SectorValuation> };
         if (sectorsResp.sectors.length > 0) {
           const items = sectorsResp.sectors.map(toHeatmapItem);
           const sectorBars = items.map(toSectorBar).filter((s): s is NonNullable<typeof s> => s !== null);
           heatmapPanel?.renderHeatmap(items, sectorBars.length ? sectorBars : undefined);
+          // Only push valuations when the response actually has the field — a
+          // payload without `valuations` must NOT clear prior valuations that
+          // may already be rendered from a previous (successful) fetch.
+          if (Object.prototype.hasOwnProperty.call(sectorsResp, 'valuations')) {
+            heatmapPanel?.updateValuations(sectorsResp.valuations);
+          }
         } else if (stocksResult.skipped) {
           this.ctx.panels['heatmap']?.showConfigError(finnhubConfigMsg);
         }
@@ -1491,7 +1649,14 @@ export class DataLoaderManager implements AppModule {
     this.ctx.inFlight.add('dailyMarketBrief');
     try {
       const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-      const cached = await getCachedDailyMarketBrief(timezone);
+      // Bound the IndexedDB cache read so a hung persistent-cache layer
+      // can't keep the panel on its default Loading state forever — fall
+      // through to "build from scratch" instead.
+      const cached = await withTimeout(
+        getCachedDailyMarketBrief(timezone),
+        3_000,
+        'daily-brief-cache-read',
+      ).catch(() => null);
 
       if (cached?.available) {
         this.callPanel('daily-market-brief', 'renderBrief', cached, 'cached');
@@ -1505,27 +1670,51 @@ export class DataLoaderManager implements AppModule {
         this.callPanel('daily-market-brief', 'showLoading', 'Building daily market brief...');
       }
 
+      // Each context collector calls a generated RPC client without its
+      // own timeout (`getFearGreedIndex`, `getFredSeriesBatch`); the
+      // `try { ... } catch` inside each collector only handles rejections
+      // — a hung RPC sits forever and `Promise.allSettled` waits with it.
+      // That's the same hang-class this PR was opened to fix; an earlier
+      // commit missed these three call sites because they were two layers
+      // up from the `summaryProvider` await I was hunting. 8s per
+      // collector is generous for an RPC and leaves >36s of the outer
+      // 60s budget for the actual LLM call.
+      // `_collectSectorContext` is sync (reads only hydrated data) so it
+      // needs no wrapping; allSettled accepts non-promises directly.
       const [r0, r1, r2] = await Promise.allSettled([
-        this._collectRegimeContext(),
-        this._collectYieldCurveContext(),
+        withTimeout(this._collectRegimeContext(), 8_000, 'daily-brief-regime-context'),
+        withTimeout(this._collectYieldCurveContext(), 8_000, 'daily-brief-yield-context'),
         this._collectSectorContext(),
       ]);
       const regimeContext = r0.status === 'fulfilled' ? r0.value : undefined;
       const yieldCurveContext = r1.status === 'fulfilled' ? r1.value : undefined;
       const sectorContext = r2.status === 'fulfilled' ? r2.value : undefined;
 
-      const brief = await buildDailyMarketBrief({
-        markets: this.ctx.latestMarkets,
-        newsByCategory: this.ctx.newsByCategory,
-        timezone,
-        regimeContext,
-        yieldCurveContext,
-        sectorContext,
-        frameworkAppend: getActiveFrameworkForPanel('daily-market-brief')?.systemPromptAppend,
-        newsCategories: SITE_VARIANT === 'commodity'
-          ? ['commodity-news', 'gold-silver', 'mining-news', 'energy', 'critical-minerals']
-          : undefined,
-      });
+      // Wall-clock budget on the whole build. The inner summarizer has its
+      // own 45s cap (SUMMARIZER_TIMEOUT_MS in daily-market-brief.ts) and
+      // falls back to rules-based output, so this outer 60s budget only
+      // fires if the rules-based path itself hangs (shouldn't, but defensive
+      // — covers e.g. a getDefaultSummarizer() dynamic-import that never
+      // resolves). On timeout the existing catch below serves the cached
+      // version or shows an error, never letting the panel stay stuck.
+      const brief = await withTimeout(
+        buildDailyMarketBrief({
+          markets: this.ctx.latestMarkets,
+          newsByCategory: this.ctx.newsByCategory,
+          timezone,
+          regimeContext,
+          yieldCurveContext,
+          sectorContext,
+          frameworkAppend: getActiveFrameworkForPanel('daily-market-brief')?.systemPromptAppend,
+          newsCategories: SITE_VARIANT === 'commodity'
+            ? ['commodity-news', 'gold-silver', 'mining-news', 'energy', 'critical-minerals']
+            : SITE_VARIANT === 'energy'
+              ? ['live-news', 'energy', 'supply-chain']
+              : undefined,
+        }),
+        60_000,
+        'daily-brief-total-build',
+      );
 
       if (this.dailyBriefGeneration !== gen) return;
 
@@ -1536,12 +1725,37 @@ export class DataLoaderManager implements AppModule {
         return;
       }
 
-      await cacheDailyMarketBrief(brief);
+      // Render first, persist after. The previous order `await
+      // cacheDailyMarketBrief(brief); render(brief)` meant a hung
+      // IndexedDB / Tauri-Store write blocked the panel from ever
+      // displaying the finished brief — the build budget proved nothing
+      // by itself. Now: user sees the brief immediately; the cache write
+      // runs fire-and-forget with its own 5s budget so a hung backend
+      // becomes "no warmup for tomorrow's load" instead of "panel stuck
+      // on Building forever."
       this.callPanel('daily-market-brief', 'renderBrief', brief, 'live');
+      void withTimeout(
+        cacheDailyMarketBrief(brief),
+        5_000,
+        'daily-brief-cache-write',
+      ).catch((err) => {
+        console.warn('[DailyBrief] cache write failed or timed out:', (err as Error).message);
+      });
     } catch (error) {
       console.warn('[DailyBrief] Failed to build daily market brief:', error);
       const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-      const cached = await getCachedDailyMarketBrief(timezone).catch(() => null);
+      // Same 3s cap as the upfront cache read above — covers the
+      // "build hung AND IndexedDB also degraded" double-failure mode
+      // (Greptile #3718 P2): without this guard the recovery path can
+      // itself hang, leaving the panel stuck on whatever the previous
+      // state was. .catch(() => null) absorbs both the TimeoutError and
+      // any persistent-cache read failure into the same null-result
+      // branch that the existing showError fallback already handles.
+      const cached = await withTimeout(
+        getCachedDailyMarketBrief(timezone),
+        3_000,
+        'daily-brief-cache-read-recovery',
+      ).catch(() => null);
       if (cached?.available) {
         this.callPanel('daily-market-brief', 'renderBrief', cached, 'cached');
         return;
@@ -2589,11 +2803,12 @@ export class DataLoaderManager implements AppModule {
   async loadOilAnalytics(): Promise<void> {
     const energyPanel = this.ctx.panels['energy-complex'] as EnergyComplexPanel | undefined;
     try {
-      const [data, crudeResp, natGasResp, euGasResp] = await Promise.allSettled([
+      const [data, crudeResp, natGasResp, euGasResp, oilStocksResp] = await Promise.allSettled([
         fetchOilAnalytics(),
         fetchCrudeInventoriesRpc(),
         fetchNatGasStorageRpc(),
         getEuGasStorageData(),
+        getOilStocksAnalysisData(),
       ]);
       if (data.status === 'fulfilled') {
         energyPanel?.updateAnalytics(data.value);
@@ -2621,6 +2836,16 @@ export class DataLoaderManager implements AppModule {
       if (euGasResp.status === 'fulfilled' && !euGasResp.value.unavailable) {
         energyPanel?.updateEuGasStorage(euGasResp.value);
       }
+      if (oilStocksResp.status === 'fulfilled' && !oilStocksResp.value.unavailable) {
+        energyPanel?.setOilStocksAnalysis(oilStocksResp.value);
+      }
+      // Fire-and-forget: LNG vulnerability is hydration-only today (no network fallback).
+      // Decoupled so a future fetch path does not delay core energy panel rendering.
+      fetchLngVulnerability().then(lngData => {
+        energyPanel?.updateLngVulnerability(lngData);
+      }).catch(() => {
+        energyPanel?.updateLngVulnerability(null);
+      });
     } catch (e) {
       console.error('[App] Oil analytics failed:', e);
       this.callPanel('energy-complex', 'showError', undefined, () => void this.loadOilAnalytics());
@@ -2683,6 +2908,10 @@ export class DataLoaderManager implements AppModule {
   }
 
   async loadTradePolicy(): Promise<void> {
+    // Trade-policy is PRO-gated. Short-circuit for anonymous/free users so
+    // we don't fire 6 RPCs that all 401 on every page load — fixes the
+    // console-noise + Sentry-noise bug from the 2026-04-22 trace.
+    if (!hasPremiumAccess()) return;
     const tradePanel = this.ctx.panels['trade-policy'] as TradePolicyPanel | undefined;
     if (!tradePanel) return;
 
@@ -2750,6 +2979,7 @@ export class DataLoaderManager implements AppModule {
 
       if (shippingData) scPanel.updateShippingRates(shippingData);
       if (chokepointData) scPanel.updateChokepointStatus(chokepointData);
+      if (chokepointData) this.ctx.map?.setChokepointData(chokepointData);
       if (mineralsData) scPanel.updateCriticalMinerals(mineralsData);
       if (stressData) scPanel.updateShippingStress(stressData);
 
@@ -2794,6 +3024,16 @@ export class DataLoaderManager implements AppModule {
       }
     } catch (e) {
       console.error('[App] Social velocity load failed:', e);
+    }
+  }
+
+  async loadWsbTickers(): Promise<void> {
+    const panel = this.ctx.panels['wsb-ticker-scanner'] as WsbTickerScannerPanel | undefined;
+    if (!panel) return;
+    try {
+      await panel.fetchData();
+    } catch (e) {
+      console.error('[App] WSB tickers load failed:', e);
     }
   }
 
@@ -3073,8 +3313,8 @@ export class DataLoaderManager implements AppModule {
   }
 
   private async loadProgressData(): Promise<void> {
-    const datasets = await fetchProgressData();
-    this.callPanel('progress', 'setData', datasets);
+    const result = await fetchProgressData();
+    this.callPanel('progress', 'setData', result);
   }
 
   private async loadSpeciesData(): Promise<void> {
@@ -3149,8 +3389,8 @@ export class DataLoaderManager implements AppModule {
 
     try {
       const result = await getResilienceRanking();
-      this.ctx.map?.setResilienceRanking(result.items);
-      const displayable = buildResilienceChoroplethMap(result.items);
+      this.ctx.map?.setResilienceRanking(result.items, result.greyedOut ?? []);
+      const displayable = buildResilienceChoroplethMap(result.items, result.greyedOut ?? []);
       this.ctx.map?.setLayerReady('resilienceScore', displayable.size > 0);
     } catch (error) {
       console.error('[App] Resilience ranking fetch failed:', error);
@@ -3201,6 +3441,26 @@ export class DataLoaderManager implements AppModule {
     } catch (error) {
       console.error('[App] Thermal escalation fetch failed:', error);
       this.callPanel('thermal-escalation', 'showError');
+    }
+  }
+
+  async loadAaiiSentiment(): Promise<void> {
+    const panel = this.ctx.panels['aaii-sentiment'] as AAIISentimentPanel | undefined;
+    if (!panel) return;
+    try {
+      await panel.fetchData();
+    } catch (e) {
+      console.error('[App] AAII sentiment load failed:', e);
+    }
+  }
+
+  async loadMarketBreadth(): Promise<void> {
+    const panel = this.ctx.panels['market-breadth'] as MarketBreadthPanel | undefined;
+    if (!panel) return;
+    try {
+      await panel.fetchData();
+    } catch (e) {
+      console.error('[App] Market breadth load failed:', e);
     }
   }
 

@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https: http://localhost:5173 ws: wss: blob: data: https://abacus.worldmonitor.app https://*.ingest.sentry.io https://*.ingest.us.sentry.io; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; script-src 'self' 'sha256-LnMFPWZxTgVOr2VYwIh9mhQ3l/l3+a3SfNOLERnuHfY=' 'sha256-4Z2xtr1B9QQugoojE/nbpOViG+8l2B7CZVlKgC78AeQ=' 'sha256-903UI9my1I7mqHoiVeZSc56yd50YoRJTB2269QqL76w=' 'sha256-EytE6o1N8rwzpVFMrF+WvBZr2y5UhFLw79o1/4VqS0s=' 'wasm-unsafe-eval' https://www.youtube.com https://static.cloudflareinsights.com https://vercel.live https://challenges.cloudflare.com https://abacus.worldmonitor.app https://*.clerk.accounts.dev https://*.hs.dodopayments.com https://*.custom.hs.dodopayments.com; worker-src 'self' blob:; font-src 'self' data: https:; media-src 'self' data: blob: https: http://127.0.0.1:* http://localhost:*; frame-src 'self' http://127.0.0.1:* http://localhost:* https://worldmonitor.app https://tech.worldmonitor.app https://finance.worldmonitor.app https://commodity.worldmonitor.app https://happy.worldmonitor.app https://www.youtube.com https://www.youtube-nocookie.com https://www.google.com https://webcams.windy.com https://challenges.cloudflare.com https://vercel.live https://*.vercel.app https://*.clerk.accounts.dev https://checkout.dodopayments.com https://test.checkout.dodopayments.com;" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https: http://localhost:5173 ws: wss: blob: data: https://abacus.worldmonitor.app https://*.ingest.sentry.io https://*.ingest.us.sentry.io; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; script-src 'self' 'sha256-LnMFPWZxTgVOr2VYwIh9mhQ3l/l3+a3SfNOLERnuHfY=' 'sha256-4Z2xtr1B9QQugoojE/nbpOViG+8l2B7CZVlKgC78AeQ=' 'sha256-903UI9my1I7mqHoiVeZSc56yd50YoRJTB2269QqL76w=' 'sha256-EytE6o1N8rwzpVFMrF+WvBZr2y5UhFLw79o1/4VqS0s=' 'wasm-unsafe-eval' https://www.youtube.com https://static.cloudflareinsights.com https://vercel.live https://challenges.cloudflare.com https://abacus.worldmonitor.app https://*.clerk.accounts.dev https://*.dodopayments.com https://js.stripe.com; worker-src 'self' blob:; font-src 'self' data: https:; media-src 'self' data: blob: https: http://127.0.0.1:* http://localhost:*; frame-src 'self' http://127.0.0.1:* http://localhost:* https://worldmonitor.app https://tech.worldmonitor.app https://finance.worldmonitor.app https://commodity.worldmonitor.app https://happy.worldmonitor.app https://www.youtube.com https://www.youtube-nocookie.com https://www.google.com https://webcams.windy.com https://challenges.cloudflare.com https://vercel.live https://*.vercel.app https://*.clerk.accounts.dev https://*.dodopayments.com https://pay.google.com https://hooks.stripe.com https://js.stripe.com;" />
     <meta name="referrer" content="strict-origin-when-cross-origin" />
 
     <!-- Primary Meta Tags -->
@@ -79,7 +79,7 @@
       "applicationCategory": "SecurityApplication",
       "operatingSystem": "Web, Windows, macOS, Linux",
       "offers": [
-        { "@type": "Offer", "price": "0", "priceCurrency": "USD", "name": "Free", "description": "Full dashboard with 435+ sources, 45 map layers, BYOK AI" },
+        { "@type": "Offer", "price": "0", "priceCurrency": "USD", "name": "Free", "description": "Full dashboard with 500+ news feeds, 65+ external data sources, 50+ map layers, BYOK AI" },
         { "@type": "Offer", "price": "0", "priceCurrency": "USD", "name": "Pro (Waitlist)", "url": "https://www.worldmonitor.app/pro" }
       ],
       "author": {
@@ -103,7 +103,7 @@
         "Earthquake and natural disaster alerts",
         "Civil unrest and protest monitoring",
         "Cyber threat and BGP anomaly detection",
-        "435+ curated RSS news feeds",
+        "500+ curated RSS news feeds and 65+ external data sources (ACLED, UCDP, NASA FIRMS, USGS, USPTO, FRED, IMF, BIS, OFAC, ECMWF, IAEA, WHO, OpenSky, ADS-B Exchange, and more)",
         "21 language support with RTL"
       ],
       "screenshot": "https://www.worldmonitor.app/favico/og-image.png",
@@ -117,8 +117,17 @@
     }
     </script>
 
-    <!-- Umami Analytics -->
-    <script defer src="https://abacus.worldmonitor.app/script.js" data-website-id="e8800335-c853-46a8-8497-c993ed2f58bc" data-domains="worldmonitor.app,tech.worldmonitor.app,finance.worldmonitor.app,commodity.worldmonitor.app,happy.worldmonitor.app"></script>
+    <!--
+      Umami Analytics — async (not defer): defer blocks DOMContentLoaded if abacus is slow/down (15s observed when origin 502s).
+      data-domains is temporarily reduced to worldmonitor.app + happy.worldmonitor.app while upstream Umami issue #4183
+      (https://github.com/umami-software/umami/issues/4183) is open — v3.1.0 has a race in
+      prisma.sessionData.updateMany() that returns HTTP 500 from /api/send for 4-8% of requests
+      across all listed hosts. Self-hosted Umami has no fix tag yet (master since 2026-04-17 has
+      22 commits but none touch sessionData). Tracker self-disables when current hostname isn't in
+      data-domains — same mechanism that keeps energy.worldmonitor.app silent. Restore tech, finance,
+      and commodity once #4183 ships in a tagged release.
+    -->
+    <script async src="https://abacus.worldmonitor.app/script.js" data-website-id="e8800335-c853-46a8-8497-c993ed2f58bc" data-domains="worldmonitor.app,happy.worldmonitor.app"></script>
 
     <!-- Favicons -->
     <link rel="icon" type="image/x-icon" href="/favico/favicon.ico" />
@@ -255,7 +264,7 @@
           <li>Stock market, commodity, and crypto tracking</li>
           <li>AI-powered intelligence synthesis and daily briefs</li>
           <li>Country Instability Index (CII) scoring</li>
-          <li>435+ curated RSS news feeds, 45 map layers</li>
+          <li>500+ curated RSS news feeds, 65+ external data sources, 50+ map layers</li>
           <li>21 language support</li>
         </ul>
         <p><a href="https://www.worldmonitor.app/pro" style="color:#4ade80;">Upgrade to World Monitor Pro</a></p>

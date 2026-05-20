@@ -29,6 +29,9 @@ const SEVERITY_COLOR: Record<FlightDelaySeverity, string> = {
     moderate: '#f97316',
     major: '#ef4444',
     severe: '#dc2626',
+    // 'unknown' = no telemetry. Render neutral grey so users don't read it
+    // as "healthy / green" (#3707).
+    unknown: '#9ca3af',
 };
 
 const STATUS_BADGE: Record<string, string> = {
@@ -90,7 +93,7 @@ export class AirlineIntelPanel extends Panel {
     private tabBar!: HTMLElement;
 
     constructor() {
-        super({ id: 'airline-intel', title: t('panels.airlineIntel'), trackActivity: true });
+        super({ id: 'airline-intel', title: t('panels.airlineIntel'), trackActivity: true, infoTooltip: t('components.airlineIntel.infoTooltip') });
 
         const wl = aviationWatchlist.get();
         this.airports = wl.airports.slice(0, 8);

@@ -7,6 +7,8 @@ import { getAiFlowSettings } from '@/services/ai-flow-settings';
 import { getSecretState } from '@/services/runtime-config';
 import { PanelGateReason } from '@/services/panel-gating';
 
+export type PanelSeverity = 'critical' | 'high' | 'medium' | 'low' | 'none';
+
 export interface PanelOptions {
   id: string;
   title: string;
@@ -201,6 +203,8 @@ export class Panel {
   protected countEl: HTMLElement | null = null;
   protected statusBadgeEl: HTMLElement | null = null;
   protected newBadgeEl: HTMLElement | null = null;
+  private severityDotEl: HTMLElement | null = null;
+  private currentSeverity: PanelSeverity = 'none';
   protected panelId: string;
   private abortController: AbortController = new AbortController();
   private tooltipCloseHandler: (() => void) | null = null;
@@ -234,6 +238,14 @@ export class Panel {
   private retryAttempt = 0;
   private _fetching = false;
   private _locked = false;
+  // Snapshot of this.content's children at the moment showLocked /
+  // showGatedCta replaces them with a lock CTA. unlockPanel re-attaches
+  // these nodes so subclasses whose UI is constructed once (typically in
+  // the ctor — chips, input rows, static chrome) don't end up with a
+  // permanently empty body after a FREE→PRO auth-state cycle. The cache
+  // holds the actual DOM nodes; reattaching preserves any listeners and
+  // any subclass references like `this.inputEl`.
+  private _savedContent: ChildNode[] | null = null;
   private _collapsed = false;
   private _collapseBtn: HTMLButtonElement | null = null;
 
@@ -253,6 +265,11 @@ export class Panel {
     title.className = 'panel-title';
     title.textContent = options.title;
     headerLeft.appendChild(title);
+
+    this.severityDotEl = document.createElement('span');
+    this.severityDotEl.className = 'panel-severity-dot';
+    this.severityDotEl.setAttribute('aria-hidden', 'true');
+    headerLeft.appendChild(this.severityDotEl);
 
     if (options.infoTooltip) {
       const infoBtn = h('button', { className: 'panel-info-btn', 'aria-label': t('components.panel.showMethodologyInfo') }, '?');
@@ -822,6 +839,7 @@ export class Panel {
   public showLocked(features: string[] = []): void {
     this._locked = true;
     this.clearRetryCountdown();
+    this._snapshotContentForRestore();
 
     for (let child = this.header.nextElementSibling; child && child !== this.content; child = child.nextElementSibling) {
       (child as HTMLElement).style.display = 'none';
@@ -860,15 +878,6 @@ export class Panel {
   }
 
   public showGatedCta(reason: PanelGateReason, onAction: () => void): void {
-    this._locked = true;
-    this.clearRetryCountdown();
-
-    // Hide elements between header and content (same as showLocked)
-    for (let child = this.header.nextElementSibling; child && child !== this.content; child = child.nextElementSibling) {
-      (child as HTMLElement).style.display = 'none';
-    }
-    this.element.classList.add('panel-is-locked');
-
     const config: Record<string, { icon: string; desc: string; cta: string }> = {
       [PanelGateReason.ANONYMOUS]: {
         icon: lockSvg,
@@ -884,6 +893,20 @@ export class Panel {
 
     const entry = config[reason];
     if (!entry) return; // PanelGateReason.NONE should never reach here
+
+    // Bail-out done — now commit to the locked state. Doing this AFTER the
+    // guard avoids a half-locked DOM (header siblings hidden, panel-is-locked
+    // class set, _savedContent populated) on the acknowledged-impossible
+    // NONE-reason path. PR #3814 review (Greptile P2).
+    this._locked = true;
+    this.clearRetryCountdown();
+    this._snapshotContentForRestore();
+
+    // Hide elements between header and content (same as showLocked)
+    for (let child = this.header.nextElementSibling; child && child !== this.content; child = child.nextElementSibling) {
+      (child as HTMLElement).style.display = 'none';
+    }
+    this.element.classList.add('panel-is-locked');
 
     const iconEl = h('div', { className: 'panel-locked-icon' });
     iconEl.innerHTML = entry.icon;
@@ -904,8 +927,27 @@ export class Panel {
     for (let child = this.header.nextElementSibling; child && child !== this.content; child = child.nextElementSibling) {
       (child as HTMLElement).style.display = '';
     }
-    // Clear the locked state content
-    replaceChildren(this.content);
+    // Restore the pre-lock content if we have it. The saved nodes are the
+    // ORIGINAL DOM nodes the subclass built — reattaching preserves event
+    // listeners and any references the subclass holds (this.inputEl etc.),
+    // and fixes constructor-only subclasses (DeductionPanel,
+    // ChatAnalystPanel, …) that would otherwise end up with an empty body.
+    // Fall back to the legacy empty-content behaviour if nothing was saved.
+    if (this._savedContent !== null) {
+      replaceChildren(this.content, ...this._savedContent);
+      this._savedContent = null;
+    } else {
+      replaceChildren(this.content);
+    }
+  }
+
+  // Capture this.content's current child nodes so unlockPanel can put them
+  // back. Only snapshots on the FIRST transition into a lock state — a
+  // re-entrant showLocked / showGatedCta must not overwrite the cache with
+  // the locked-state CTA. The cache is cleared by unlockPanel on restore.
+  private _snapshotContentForRestore(): void {
+    if (this._savedContent !== null) return;
+    this._savedContent = Array.from(this.content.childNodes);
   }
 
   public showRetrying(message?: string, countdownSeconds?: number): void {
@@ -1079,6 +1121,20 @@ export class Panel {
   }
 
   /**
+   * Set the panel's severity level, controlling the header pulse dot speed.
+   * critical = 0.6s, high = 1s, medium = 1.8s, low = 2.5s, none = hidden.
+   */
+  public setSeverity(level: PanelSeverity): void {
+    if (level === this.currentSeverity) return;
+    this.currentSeverity = level;
+    if (!this.severityDotEl) return;
+    this.severityDotEl.className = 'panel-severity-dot';
+    if (level !== 'none') {
+      this.severityDotEl.classList.add(`severity-${level}`);
+    }
+  }
+
+  /**
    * Get the panel ID
    */
   public getId(): string {
@@ -1120,6 +1176,10 @@ export class Panel {
       this.contentDebounceTimer = null;
     }
     this.pendingContentHtml = null;
+    // Drop the snapshot of pre-lock children so a panel destroyed while
+    // still in the locked state doesn't retain the detached DOM subtree
+    // for the lifetime of the Panel instance. PR #3814 review (Greptile P2).
+    this._savedContent = null;
 
     if (this.tooltipCloseHandler) {
       document.removeEventListener('click', this.tooltipCloseHandler);

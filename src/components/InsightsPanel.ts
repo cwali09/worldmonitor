@@ -18,7 +18,7 @@ import { getAiFlowSettings, isAnyAiProviderEnabled, subscribeAiFlowChange } from
 import { getActiveFrameworkForPanel, subscribeFrameworkChange } from '@/services/analysis-framework-store';
 import { hasPremiumAccess } from '@/services/panel-gating';
 import { FrameworkSelector } from './FrameworkSelector';
-import { getServerInsights, type ServerInsights, type ServerInsightStory } from '@/services/insights-loader';
+import { fetchServerInsights, getServerInsights, type ServerInsights, type ServerInsightStory } from '@/services/insights-loader';
 import { computeISQ, type SignalQuality, type SignalQualityInput } from '@/utils/signal-quality';
 import { extractEntitiesFromTitle } from '@/services/entity-extraction';
 import { getEntityIndex } from '@/services/entity-index';
@@ -61,7 +61,7 @@ export class InsightsPanel extends Panel {
       void this.updateInsights(this.lastClusters);
     });
 
-    this.fwSelector = new FrameworkSelector({ panelId: 'insights', isPremium: hasPremiumAccess(), panel: this, note: 'Applies to client-generated analysis only' });
+    this.fwSelector = new FrameworkSelector({ panelId: 'insights', isPremium: hasPremiumAccess(), panel: this, note: t('components.insights.frameworkNote') });
     this.header.appendChild(this.fwSelector.el);
   }
 
@@ -185,7 +185,18 @@ export class InsightsPanel extends Panel {
     const thisGeneration = this.updateGeneration;
 
     // Try server-side pre-computed insights first (instant, works even without clusters)
-    const serverInsights = getServerInsights();
+    let serverInsights = getServerInsights();
+    if (!serverInsights) {
+      // Bootstrap hydration miss (mobile fast-tier abort on 4G, stale cache,
+      // or single-shot getHydratedData already consumed). On-demand refetch
+      // via the bootstrap key-filter endpoint covers all three cases —
+      // critical for mobile where the client-side LLM fallback is gated off,
+      // and a free win for desktop (no client LLM cost when server data is
+      // recoverable). Mirrors the AAIISentimentPanel pattern.
+      if (this.updateGeneration !== thisGeneration) return;
+      serverInsights = await fetchServerInsights();
+      if (this.updateGeneration !== thisGeneration) return;
+    }
     if (serverInsights) {
       await this.updateFromServer(serverInsights, clusters, thisGeneration);
       return;
@@ -221,7 +232,7 @@ export class InsightsPanel extends Panel {
       }
 
       // Step 1: Signal aggregation (client-side, depends on real-time map data)
-      this.setProgress(1, totalSteps, 'Loading server insights...');
+      this.setProgress(1, totalSteps, t('components.insights.loadingServerInsights'));
 
       let signalSummary: ReturnType<typeof signalAggregator.getSummary>;
       let focalSummary: ReturnType<typeof focalPointDetector.analyze>;
@@ -396,19 +407,22 @@ export class InsightsPanel extends Panel {
         // Pass focal point context + theater posture to AI for correlation-aware summarization
         // Tech variant: no geopolitical context, just tech news summarization
         // Commodity variant: commodities-specific framing for gold/metals/energy markets
+        // Energy variant: energy-specific framing — pipelines, chokepoints, shortages, disruptions
         const theaterContext = SITE_VARIANT === 'full' ? this.getTheaterPostureContext() : '';
         let geoContext = SITE_VARIANT === 'full'
           ? (focalSummary.aiContext || signalSummary.aiContext) + theaterContext
           : SITE_VARIANT === 'commodity'
             ? 'You are generating a commodities market brief. Focus on gold and precious metals price movements, mining supply risks, energy market dynamics, and macro factors driving commodity prices. Highlight supply disruptions, geopolitical risks to mining regions, central bank gold activity, and USD/inflation trends.'
-            : '';
+            : SITE_VARIANT === 'energy'
+              ? 'You are generating a global energy-intelligence brief. Focus on physical supply: oil & gas pipeline status and disruptions (Druzhba, Nord Stream, TurkStream, Power of Siberia, CPC), chokepoint flow (Hormuz, Malacca, Suez, Bab el-Mandeb, Turkish Straits, Danish Straits, Panama), storage levels (EU gas, US SPR, IEA stocks, days-of-cover), fuel shortages (jet / petrol / diesel / heating oil), refinery outages, LNG flows, OPEC+ production signals, and sanctions impacts. Prefer physical constraints and evidence-grounded status changes over price commentary. Attribute every flow figure to its source (AIS calibration, operator disclosure, regulator data) — never ship a bare conclusion.'
+              : '';
         const insightsFw = getActiveFrameworkForPanel('insights');
         if (insightsFw) {
           geoContext = `${geoContext}\n\n---\nAnalytical Framework:\n${insightsFw.systemPromptAppend}`;
         }
         const result = await generateSummary(titles, (_step, _total, msg) => {
           // Show sub-progress for summarization
-          this.setProgress(3, totalSteps, `Generating brief: ${msg}`);
+          this.setProgress(3, totalSteps, t('components.insights.generatingBriefSub', { msg }));
         }, geoContext, undefined, summarizeOpts);
 
         if (this.updateGeneration !== thisGeneration) return;
@@ -420,13 +434,13 @@ export class InsightsPanel extends Panel {
           void setPersistentCache(InsightsPanel.BRIEF_CACHE_KEY, { summary: worldBrief });
         }
       } else {
-        this.setProgress(3, totalSteps, 'Using cached brief...');
+        this.setProgress(3, totalSteps, t('components.insights.usingCachedBrief'));
       }
 
       this.setDataBadge(worldBrief ? 'live' : 'unavailable');
 
       // Step 4: Wait for parallel analysis to complete
-      this.setProgress(4, totalSteps, 'Multi-perspective analysis...');
+      this.setProgress(4, totalSteps, t('components.insights.multiPerspectiveAnalysis'));
       await parallelPromise;
 
       if (this.updateGeneration !== thisGeneration) return;
@@ -459,7 +473,7 @@ export class InsightsPanel extends Panel {
       ${sentimentOverview}
       ${statsHtml}
       <div class="insights-section">
-        <div class="insights-section-title">BREAKING & CONFIRMED</div>
+        <div class="insights-section-title">${t('components.insights.breakingConfirmed')}</div>
         ${breakingHtml}
       </div>
       ${missedHtml}
@@ -485,7 +499,7 @@ export class InsightsPanel extends Panel {
       ${sentimentOverview}
       ${statsHtml}
       <div class="insights-section">
-        <div class="insights-section-title">BREAKING & CONFIRMED</div>
+        <div class="insights-section-title">${t('components.insights.breakingConfirmed')}</div>
         ${storiesHtml}
       </div>
       ${missedHtml}
@@ -504,13 +518,13 @@ export class InsightsPanel extends Panel {
       const badges: string[] = [];
 
       if (story.sourceCount >= 3) {
-        badges.push(`<span class="insight-badge confirmed">✓ ${story.sourceCount} sources</span>`);
+        badges.push(`<span class="insight-badge confirmed">✓ ${t('components.insights.sources', { count: story.sourceCount })}</span>`);
       } else if (story.sourceCount >= 2) {
-        badges.push(`<span class="insight-badge multi">${story.sourceCount} sources</span>`);
+        badges.push(`<span class="insight-badge multi">${t('components.insights.sources', { count: story.sourceCount })}</span>`);
       }
 
       if (story.isAlert) {
-        badges.push('<span class="insight-badge alert">⚠ ALERT</span>');
+        badges.push(`<span class="insight-badge alert">⚠ ${t('components.insights.alert')}</span>`);
       }
 
       const VALID_THREAT_LEVELS = ['critical', 'high', 'elevated', 'moderate', 'medium', 'low', 'info'];
@@ -536,24 +550,29 @@ export class InsightsPanel extends Panel {
       <div class="insights-stats">
         <div class="insight-stat">
           <span class="insight-stat-value">${insights.multiSourceCount}</span>
-          <span class="insight-stat-label">Multi-source</span>
+          <span class="insight-stat-label">${t('components.insights.multiSource')}</span>
         </div>
         <div class="insight-stat">
           <span class="insight-stat-value">${insights.fastMovingCount}</span>
-          <span class="insight-stat-label">Fast-moving</span>
+          <span class="insight-stat-label">${t('components.insights.fastMoving')}</span>
         </div>
         <div class="insight-stat">
           <span class="insight-stat-value">${insights.clusterCount}</span>
-          <span class="insight-stat-label">Clusters</span>
+          <span class="insight-stat-label">${t('components.insights.clusters')}</span>
         </div>
       </div>
     `;
   }
 
   private renderWorldBrief(brief: string): string {
+    const heading =
+      SITE_VARIANT === 'tech'      ? `🚀 ${t('components.insights.briefTech')}`
+    : SITE_VARIANT === 'commodity' ? `⛏️ ${t('components.insights.briefCommodity')}`
+    : SITE_VARIANT === 'energy'    ? `⚡ ${t('components.insights.briefEnergy')}`
+    :                                `🌍 ${t('components.insights.briefWorld')}`;
     return `
       <div class="insights-brief">
-        <div class="insights-section-title">${SITE_VARIANT === 'tech' ? '🚀 TECH BRIEF' : SITE_VARIANT === 'commodity' ? '⛏️ COMMODITY BRIEF' : '🌍 WORLD BRIEF'}</div>
+        <div class="insights-section-title">${heading}</div>
         <div class="insights-brief-text">${escapeHtml(brief)}</div>
       </div>
     `;
@@ -580,9 +599,9 @@ export class InsightsPanel extends Panel {
       }
 
       if (cluster.sourceCount >= 3) {
-        badges.push(`<span class="insight-badge confirmed">✓ ${cluster.sourceCount} sources</span>`);
+        badges.push(`<span class="insight-badge confirmed">✓ ${t('components.insights.sources', { count: cluster.sourceCount })}</span>`);
       } else if (cluster.sourceCount >= 2) {
-        badges.push(`<span class="insight-badge multi">${cluster.sourceCount} sources</span>`);
+        badges.push(`<span class="insight-badge multi">${t('components.insights.sources', { count: cluster.sourceCount })}</span>`);
       }
 
       if (cluster.velocity && cluster.velocity.level !== 'normal') {
@@ -591,7 +610,7 @@ export class InsightsPanel extends Panel {
       }
 
       if (cluster.isAlert) {
-        badges.push('<span class="insight-badge alert">⚠ ALERT</span>');
+        badges.push(`<span class="insight-badge alert">⚠ ${t('components.insights.alert')}</span>`);
       }
 
       return `
@@ -620,13 +639,13 @@ export class InsightsPanel extends Panel {
     const neuPct = Math.round((neutral / total) * 100);
     const posPct = 100 - negPct - neuPct;
 
-    let toneLabel = 'Mixed';
+    let toneLabel = t('components.insights.toneMixed');
     let toneClass = 'neutral';
     if (negative > positive + neutral) {
-      toneLabel = 'Negative';
+      toneLabel = t('components.insights.toneNegative');
       toneClass = 'negative';
     } else if (positive > negative + neutral) {
-      toneLabel = 'Positive';
+      toneLabel = t('components.insights.tonePositive');
       toneClass = 'positive';
     }
 
@@ -642,7 +661,7 @@ export class InsightsPanel extends Panel {
           <span class="sentiment-label neutral">${neutral}</span>
           <span class="sentiment-label positive">${positive}</span>
         </div>
-        <div class="sentiment-tone ${toneClass}">Overall: ${toneLabel}</div>
+        <div class="sentiment-tone ${toneClass}">${t('components.insights.overall', { tone: toneLabel })}</div>
       </div>
     `;
   }
@@ -656,16 +675,16 @@ export class InsightsPanel extends Panel {
       <div class="insights-stats">
         <div class="insight-stat">
           <span class="insight-stat-value">${multiSource}</span>
-          <span class="insight-stat-label">Multi-source</span>
+          <span class="insight-stat-label">${t('components.insights.multiSource')}</span>
         </div>
         <div class="insight-stat">
           <span class="insight-stat-value">${fastMoving}</span>
-          <span class="insight-stat-label">Fast-moving</span>
+          <span class="insight-stat-label">${t('components.insights.fastMoving')}</span>
         </div>
         ${alerts > 0 ? `
         <div class="insight-stat alert">
           <span class="insight-stat-value">${alerts}</span>
-          <span class="insight-stat-label">Alerts</span>
+          <span class="insight-stat-label">${t('components.insights.alertsLabel')}</span>
         </div>
         ` : ''}
       </div>
@@ -704,7 +723,7 @@ export class InsightsPanel extends Panel {
 
     return `
       <div class="insights-section insights-missed">
-        <div class="insights-section-title">🎯 ML DETECTED</div>
+        <div class="insights-section-title">🎯 ${t('components.insights.mlDetected')}</div>
         ${storiesHtml}
       </div>
     `;
@@ -730,14 +749,14 @@ export class InsightsPanel extends Panel {
         <div class="convergence-zone">
           <div class="convergence-region">${icons} ${escapeHtml(zone.region)}</div>
           <div class="convergence-description">${escapeHtml(zone.description)}</div>
-          <div class="convergence-stats">${zone.signalTypes.length} signal types • ${zone.totalSignals} events</div>
+          <div class="convergence-stats">${t('components.insights.signalTypesEvents', { types: zone.signalTypes.length, events: zone.totalSignals })}</div>
         </div>
       `;
     }).join('');
 
     return `
       <div class="insights-section insights-convergence">
-        <div class="insights-section-title">📍 GEOGRAPHIC CONVERGENCE</div>
+        <div class="insights-section-title">📍 ${t('components.insights.geographicConvergence')}</div>
         ${zonesHtml}
       </div>
     `;
@@ -778,7 +797,7 @@ export class InsightsPanel extends Panel {
           </div>
           <div class="focal-point-signals">${icons}</div>
           <div class="focal-point-stats">
-            ${fp.newsMentions} news • ${fp.signalCount} signals
+            ${t('components.insights.newsSignals', { news: fp.newsMentions, signals: fp.signalCount })}
           </div>
           ${headlineText && headlineUrl ? `<a href="${headlineUrl}" target="_blank" rel="noopener" class="focal-point-headline">"${escapeHtml(headlineText)}..."</a>` : ''}
         </div>
@@ -787,7 +806,7 @@ export class InsightsPanel extends Panel {
 
     return `
       <div class="insights-section insights-focal">
-        <div class="insights-section-title">🎯 FOCAL POINTS</div>
+        <div class="insights-section-title">🎯 ${t('components.insights.focalPoints')}</div>
         ${focalPointsHtml}
       </div>
     `;

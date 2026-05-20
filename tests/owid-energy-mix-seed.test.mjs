@@ -1,14 +1,23 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
+  parseOwidCsv,
   buildExposureIndex,
+  buildAllCountriesMap,
   OWID_ENERGY_MIX_KEY_PREFIX,
   OWID_EXPOSURE_INDEX_KEY,
   OWID_COUNTRY_LIST_KEY,
+  OWID_ALL_KEY,
   OWID_META_KEY,
   OWID_TTL_SECONDS,
 } from '../scripts/seed-owid-energy-mix.mjs';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const FIXTURE_DIR = resolve(__dirname, 'fixtures');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -126,6 +135,10 @@ describe('exported key constants', () => {
     assert.equal(OWID_COUNTRY_LIST_KEY, 'energy:mix:v1:_countries');
   });
 
+  it('OWID_ALL_KEY matches expected pattern', () => {
+    assert.equal(OWID_ALL_KEY, 'energy:mix:v1:_all');
+  });
+
   it('OWID_META_KEY matches expected pattern', () => {
     assert.equal(OWID_META_KEY, 'seed-meta:economic:owid-energy-mix');
   });
@@ -133,5 +146,105 @@ describe('exported key constants', () => {
   it('OWID_TTL_SECONDS covers the monthly cron cadence (35 days)', () => {
     assert.ok(OWID_TTL_SECONDS >= 35 * 24 * 3600,
       `TTL ${OWID_TTL_SECONDS}s is less than 35 days — meta would expire before next monthly run`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildAllCountriesMap — bulk key shape
+// ---------------------------------------------------------------------------
+
+describe('buildAllCountriesMap', () => {
+  it('has the same country count as the input map', () => {
+    const countries = makeCountries();
+    const all = buildAllCountriesMap(countries);
+    assert.equal(Object.keys(all).length, countries.size,
+      '_all entry count must match _countries count');
+  });
+
+  it('each entry has exactly the 9 numeric share fields plus year', () => {
+    const expectedFields = ['year', 'coalShare', 'gasShare', 'oilShare', 'nuclearShare', 'renewShare', 'windShare', 'solarShare', 'hydroShare', 'importShare'];
+    const all = buildAllCountriesMap(makeCountries());
+    for (const [iso2, entry] of Object.entries(all)) {
+      const keys = Object.keys(entry).sort();
+      assert.deepEqual(keys, [...expectedFields].sort(),
+        `Entry for ${iso2} has unexpected fields: ${JSON.stringify(keys)}`);
+    }
+  });
+
+  it('no entry has iso2, country, or seededAt fields', () => {
+    const all = buildAllCountriesMap(makeCountries());
+    for (const [iso2, entry] of Object.entries(all)) {
+      assert.ok(!('iso2' in entry), `Entry for ${iso2} must not have iso2 field`);
+      assert.ok(!('country' in entry), `Entry for ${iso2} must not have country field`);
+      assert.ok(!('seededAt' in entry), `Entry for ${iso2} must not have seededAt field`);
+    }
+  });
+
+  it('preserves null share values from input', () => {
+    const all = buildAllCountriesMap(makeCountries());
+    assert.equal(all['MT'].coalShare, null, 'MT coalShare should be null');
+    assert.equal(all['MT'].gasShare, null, 'MT gasShare should be null');
+  });
+
+  it('preserves correct numeric values', () => {
+    const all = buildAllCountriesMap(makeCountries());
+    assert.equal(all['DE'].coalShare, 26);
+    assert.equal(all['NO'].renewShare, 97);
+    assert.equal(all['SA'].oilShare, 62);
+  });
+
+  it('keys are ISO2 codes matching the input map keys', () => {
+    const countries = makeCountries();
+    const all = buildAllCountriesMap(countries);
+    for (const iso2 of countries.keys()) {
+      assert.ok(iso2 in all, `ISO2 ${iso2} missing from _all map`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Golden fixture: upstream CSV format regression guard
+// ---------------------------------------------------------------------------
+
+describe('golden fixture (OWID CSV)', () => {
+  const csv = readFileSync(resolve(FIXTURE_DIR, 'owid-energy-sample.csv'), 'utf-8');
+
+  it('parseOwidCsv returns at least 1 country from the fixture', () => {
+    const countries = parseOwidCsv(csv);
+    assert.ok(countries.size >= 1, `expected >=1 country, got ${countries.size}`);
+  });
+
+  it('picks the most recent year per country (US 2023 over 2022)', () => {
+    const countries = parseOwidCsv(csv);
+    const us = countries.get('US');
+    assert.ok(us != null, 'US entry missing');
+    assert.equal(us.year, 2023);
+  });
+
+  it('all parsed entries have the expected share fields', () => {
+    const expected = ['coalShare', 'gasShare', 'oilShare', 'nuclearShare', 'renewShare', 'windShare', 'solarShare', 'hydroShare', 'importShare'];
+    const countries = parseOwidCsv(csv);
+    for (const [iso2, entry] of countries) {
+      for (const field of expected) {
+        assert.ok(field in entry, `${iso2} missing field ${field}`);
+      }
+    }
+  });
+
+  it('share values are numbers or null', () => {
+    const countries = parseOwidCsv(csv);
+    for (const [iso2, entry] of countries) {
+      for (const key of ['coalShare', 'gasShare', 'oilShare', 'renewShare']) {
+        const val = entry[key];
+        assert.ok(val === null || typeof val === 'number', `${iso2}.${key} should be number|null, got ${typeof val}`);
+      }
+    }
+  });
+
+  it('fixture contains US, DE, JP', () => {
+    const countries = parseOwidCsv(csv);
+    assert.ok(countries.has('US'), 'US missing');
+    assert.ok(countries.has('DE'), 'DE missing');
+    assert.ok(countries.has('JP'), 'JP missing');
   });
 });

@@ -3,11 +3,35 @@
 import { loadEnvFile, CHROME_UA, getRedisCredentials, runSeed } from './_seed-utils.mjs';
 import { clusterItems, selectTopStories } from './_clustering.mjs';
 import { extractCountryCode } from './shared/geo-extract.mjs';
+import { unwrapEnvelope } from './_seed-envelope-source.mjs';
+import { pickBriefCluster, briefSystemPrompt, briefUserPrompt } from './_insights-brief.mjs';
+// Import from the scripts mirror (`scripts/shared/`) — NOT the repo-root
+// `shared/`. Railway services with nixpacks `rootDirectory=scripts` only
+// package files under scripts/; a `../shared/` import resolves to
+// `/shared/...` at runtime which is absent in the container and crashes
+// the seeder on startup. The local pattern is the `./shared/geo-extract.mjs`
+// line above. PR #3836 review caught this. See skill
+// railway-deploy-gotchas/reference/nixpacks-root-dir-scripts-cross-dir-import-escape.
+import { validateNoHallucinatedProperNouns } from './shared/brief-llm-core.js';
+
+// Hallucination validator rollout mode (PR-2 of brief-content-quality
+// regressions). `shadow` = log violations to Sentry but ship the LLM
+// output unchanged (default, safe). `enforce` = on violation, replace
+// the LLM summary with the source headline. Flip via Railway env after
+// the 7-day shadow window confirms <5% violation rate.
+const BRIEF_VALIDATOR_MODE =
+  process.env.BRIEF_VALIDATOR_MODE === 'enforce' ? 'enforce' : 'shadow';
 
 loadEnvFile(import.meta.url);
 
 const CANONICAL_KEY = 'news:insights:v1';
 const DIGEST_KEY = 'news:digest:v1:full:en';
+
+// Defense-in-depth auth — see seed-infra.mjs for the same pattern + rationale.
+// Set WORLDMONITOR_RELAY_KEY on the Railway service (must match a value in
+// Vercel's WORLDMONITOR_VALID_KEYS). Origin alone is no longer reliable
+// because CF/Vercel intermediaries may strip it and CF can cache the 401.
+const RELAY_API_KEY = process.env.WORLDMONITOR_RELAY_KEY || '';
 
 // Digest items store proto enum strings (THREAT_LEVEL_HIGH etc.) from toProtoItem().
 // Normalize to client-side lowercase values before propagating into insights output.
@@ -25,8 +49,10 @@ function normalizeThreat(threat) {
   return { ...threat, level };
 }
 
-const CACHE_TTL = 10800; // 3h — 6x the 30 min cron interval (was 1x = key expired on any missed run)
-const MAX_HEADLINES = 10;
+const CACHE_TTL = 10800; // 3h — 6x the 30 min cron interval. Shorter = key expires on any missed
+                         // cron tick and /api/bootstrap loses insights entirely. Bad brief content
+                         // is gated at brief-selection time (see pickBriefCluster + briefSystemPrompt
+                         // in _insights-brief.mjs), not by aging out fast.
 const MAX_HEADLINE_LEN = 500;
 const GROQ_MODEL = 'llama-3.1-8b-instant';
 
@@ -60,7 +86,7 @@ async function readDigestFromRedis() {
   });
   if (!resp.ok) return null;
   const data = await resp.json();
-  return data.result ? JSON.parse(data.result) : null;
+  return data.result ? unwrapEnvelope(JSON.parse(data.result)).data : null;
 }
 
 async function readExistingInsights() {
@@ -71,7 +97,7 @@ async function readExistingInsights() {
   });
   if (!resp.ok) return null;
   const data = await resp.json();
-  return data.result ? JSON.parse(data.result) : null;
+  return data.result ? unwrapEnvelope(JSON.parse(data.result)).data : null;
 }
 
 // Provider config — mirrors server/_shared/llm.ts getProviderCredentials()
@@ -109,23 +135,9 @@ const LLM_PROVIDERS = [
   },
 ];
 
-async function callLLM(headlines) {
-  const headlineText = headlines.map((h, i) => `${i + 1}. ${h}`).join('\n');
-  const dateContext = `Current date: ${new Date().toISOString().split('T')[0]}. Provide geopolitical context appropriate for the current date.`;
-
-  const systemPrompt = `${dateContext}
-
-Summarize the single most important headline in 2 concise sentences MAX (under 60 words total).
-Rules:
-- Each numbered headline below is a SEPARATE, UNRELATED story
-- Pick the ONE most significant headline and summarize ONLY that story
-- NEVER combine or merge people, places, or facts from different headlines into one sentence
-- Lead with WHAT happened and WHERE - be specific
-- NEVER start with "Breaking news", "Good evening", "Tonight", or TV-style openings
-- Start directly with the subject of the chosen headline
-- No bullet points, no meta-commentary, no elaboration beyond the core facts`;
-
-  const userPrompt = `Each headline below is a separate story. Pick the most important ONE and summarize only that story:\n${headlineText}`;
+async function callLLM(headline) {
+  const systemPrompt = briefSystemPrompt(new Date().toISOString().split('T')[0]);
+  const userPrompt = briefUserPrompt(headline);
 
   for (const provider of LLM_PROVIDERS) {
     const envVal = process.env[provider.envKey];
@@ -145,7 +157,7 @@ Rules:
             { role: 'user', content: userPrompt },
           ],
           max_tokens: 300,
-          temperature: 0.3,
+          temperature: 0.1,
           ...provider.extraBody,
         }),
         signal: AbortSignal.timeout(provider.timeout),
@@ -206,13 +218,21 @@ function categorizeStory(title) {
 
 async function warmDigestCache() {
   const apiBase = process.env.API_BASE_URL || 'https://api.worldmonitor.app';
+  const headers = {
+    'User-Agent': CHROME_UA,
+    Origin: 'https://worldmonitor.app',
+  };
+  if (RELAY_API_KEY) headers['X-WorldMonitor-Key'] = RELAY_API_KEY;
   try {
     const resp = await fetch(`${apiBase}/api/news/v1/list-feed-digest?variant=full&lang=en`, {
-      headers: { 'User-Agent': CHROME_UA },
+      headers,
       signal: AbortSignal.timeout(30_000),
     });
     if (resp.ok) console.log('  Digest cache warmed via RPC');
-    else console.warn(`  Digest warm failed: HTTP ${resp.status}`);
+    else {
+      const keyNote = RELAY_API_KEY ? '' : ' (WORLDMONITOR_RELAY_KEY not set — Origin-only auth)';
+      console.warn(`  Digest warm failed: HTTP ${resp.status}${keyNote}`);
+    }
   } catch (err) {
     console.warn(`  Digest warm failed: ${err.message}`);
   }
@@ -275,24 +295,64 @@ async function fetchInsights() {
 
   if (topStories.length === 0) throw new Error('No top stories after scoring');
 
-  const headlines = topStories
-    .slice(0, MAX_HEADLINES)
-    .map(s => sanitizeTitle(s.primaryTitle));
+  // Corroboration gate: only brief a story at least two outlets have reported.
+  // See pickBriefCluster() in _insights-brief.mjs for rationale + unit tests.
+  // Note: this gates ONLY brief generation — the topStories payload itself
+  // continues to include single-source clusters, rendered as the headline list
+  // under the brief. The brief paragraph is the one surface where corroboration
+  // matters; the list is already visually marked with per-story sourceCount.
+  const briefCluster = pickBriefCluster(topStories);
+  const topHeadline = briefCluster ? sanitizeTitle(briefCluster.primaryTitle) : '';
 
   let worldBrief = '';
   let briefProvider = '';
   let briefModel = '';
   let status = 'ok';
 
-  const llmResult = await callLLM(headlines);
-  if (llmResult) {
-    worldBrief = llmResult.text;
-    briefProvider = llmResult.provider;
-    briefModel = llmResult.model;
-    console.log(`  Brief generated via ${briefProvider} (${briefModel})`);
-  } else {
+  if (!topHeadline) {
     status = 'degraded';
-    console.warn('  No LLM available — publishing degraded (stories without brief)');
+    console.warn('  No multi-source cluster available — publishing degraded (stories without brief)');
+  } else {
+    const llmResult = await callLLM(topHeadline);
+    if (llmResult) {
+      // Hallucination check: did the LLM invent proper nouns not in
+      // the headline? The May 19 brief shipped "Lebanese President
+      // Michel Aoun pledged..." against a headline that contained no
+      // name. See docs/plans/2026-05-19-001 U2.
+      const validation = validateNoHallucinatedProperNouns(llmResult.text, topHeadline);
+      if (!validation.ok) {
+        const hallucinated = (validation.hallucinated || []).join(' ');
+        if (BRIEF_VALIDATOR_MODE === 'enforce') {
+          // Replace the LLM summary with the source headline. R1 of the
+          // plan: "falls back to a safe summary (headline-grounded
+          // template) rather than publishing the hallucination."
+          worldBrief = topHeadline;
+          briefProvider = `${llmResult.provider}+headline-fallback`;
+          briefModel = llmResult.model;
+          console.warn(
+            `  [brief_hallucination ENFORCE] dropped LLM summary: invented "${hallucinated}" not in headline; fell back to headline`
+          );
+        } else {
+          // Shadow mode: log but ship the LLM output. The 7-day rollout
+          // window measures the false-positive rate before flipping to
+          // enforce.
+          worldBrief = llmResult.text;
+          briefProvider = llmResult.provider;
+          briefModel = llmResult.model;
+          console.warn(
+            `  [brief_hallucination SHADOW] would have dropped LLM summary: invented "${hallucinated}" not in headline`
+          );
+        }
+      } else {
+        worldBrief = llmResult.text;
+        briefProvider = llmResult.provider;
+        briefModel = llmResult.model;
+        console.log(`  Brief generated via ${briefProvider} (${briefModel})`);
+      }
+    } else {
+      status = 'degraded';
+      console.warn('  No LLM available — publishing degraded (stories without brief)');
+    }
   }
 
   const multiSourceCount = clusters.filter(c => c.sourceCount >= 2).length;
@@ -349,10 +409,18 @@ function validate(data) {
   return Array.isArray(data?.topStories) && data.topStories.length >= 1;
 }
 
+export function declareRecords(data) {
+  return Array.isArray(data?.topStories) ? data.topStories.length : 0;
+}
+
 runSeed('news', 'insights', CANONICAL_KEY, fetchInsights, {
   validateFn: validate,
   ttlSeconds: CACHE_TTL,
   sourceVersion: 'digest-clustering-v1',
+
+  declareRecords,
+  schemaVersion: 1,
+  maxStaleMin: 30,
 }).catch((err) => {
   const _cause = err.cause ? ` (cause: ${err.cause.message || err.cause.code || err.cause})` : ''; console.error('FATAL:', (err.message || err) + _cause);
   // Exit gracefully for cron — health endpoint flags stale data via seed-meta.

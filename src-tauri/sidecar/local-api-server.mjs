@@ -414,6 +414,15 @@ async function proxyToCloud(requestUrl, req, remoteBase) {
   // Identify sidecar as trusted origin so the cloud API key validator
   // doesn't reject the request (no origin + no key = 401).
   headers.set('Origin', 'https://worldmonitor.app');
+  // Inject the configured enterprise key for cloud calls that pass through the
+  // sidecar so auth-gated endpoints (e.g. /api/mcp-proxy per PR #3768, issue
+  // #3723) succeed without each renderer call having to attach it. Renderer-
+  // supplied X-WorldMonitor-Key (e.g. a wm_ user key from runtime config) wins
+  // — don't clobber it.
+  if (!headers.has('X-WorldMonitor-Key')) {
+    const wmKey = process.env.WORLDMONITOR_API_KEY;
+    if (wmKey) headers.set('X-WorldMonitor-Key', wmKey);
+  }
   return fetch(target, {
     method: req.method,
     headers,
@@ -1212,10 +1221,14 @@ async function dispatch(requestUrl, req, routes, context) {
   }
   // Registration — call Convex directly when CONVEX_URL is available (self-hosted),
   // otherwise proxy to cloud (desktop sidecar never has CONVEX_URL).
+  // Keeps the legacy /api/register-interest local path so older desktop builds
+  // continue to work; cloud fallback rewrites to the new sebuf RPC path.
   if (requestUrl.pathname === '/api/register-interest' && req.method === 'POST') {
     const convexUrl = process.env.CONVEX_URL;
     if (!convexUrl) {
-      const cloudResponse = await tryCloudFallback(requestUrl, req, context, 'no CONVEX_URL');
+      const cloudUrl = new URL(requestUrl);
+      cloudUrl.pathname = '/api/leads/v1/register-interest';
+      const cloudResponse = await tryCloudFallback(cloudUrl, req, context, 'no CONVEX_URL');
       if (cloudResponse) return cloudResponse;
       return json({ error: 'Registration service unavailable' }, 503);
     }
