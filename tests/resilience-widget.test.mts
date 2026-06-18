@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -6,16 +7,24 @@ import {
   collectDimensionConfidences,
   formatBaselineStress,
   formatDimensionConfidence,
+  formatResilienceMethodologyHelpTitle,
   formatResilienceChange30d,
   formatResilienceConfidence,
   formatResilienceDataVersion,
+  formatResilienceScoreInterval,
   getImputationClassIcon,
   getImputationClassLabel,
+  getResilienceMethodologySummary,
+  formatScoredResilienceOverallLabel,
+  getResilienceOverallDisplay,
   getResilienceDimensionLabel,
   getResilienceDomainLabel,
   getResilienceTrendArrow,
   getResilienceVisualLevel,
+  hasScoredResilienceOverall,
+  getStalenessIcon,
   getStalenessLabel,
+  shouldRenderResilienceBaselineStress,
 } from '../src/components/resilience-widget-utils';
 import type { ResilienceScoreResponse } from '../src/services/resilience';
 
@@ -38,6 +47,33 @@ const baseResponse: ResilienceScoreResponse = {
   dataVersion: '2026-04-03',
 };
 
+test('ResilienceWidget stays out of the components barrel and loads through CountryDeepDivePanel dynamically', async () => {
+  const [barrelSource, deepDiveSource] = await Promise.all([
+    readFile(new URL('../src/components/index.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/components/CountryDeepDivePanel.ts', import.meta.url), 'utf8'),
+  ]);
+
+  assert.doesNotMatch(barrelSource, /export\s+\*\s+from\s+['"]\.\/ResilienceWidget['"]/);
+  assert.doesNotMatch(deepDiveSource, /import\s+\{\s*ResilienceWidget\s*\}\s+from\s+['"]\.\/ResilienceWidget['"]/);
+  assert.match(deepDiveSource, /import\(['"]@\/components\/ResilienceWidget['"]\)/);
+  assert.match(deepDiveSource, /import\(['"]@\/components\/ResilienceWidget['"]\)[\s\S]*?\.then\(\(\{\s*ResilienceWidget\s*\}\)\s*=>[\s\S]*?\)\s*\.catch\(renderFallback\)/);
+});
+
+test('ResilienceWidget auth refresh guard tolerates malformed server countryCode values', async () => {
+  const source = await readFile(new URL('../src/components/ResilienceWidget.ts', import.meta.url), 'utf8');
+
+  assert.match(
+    source,
+    /const loadedCountryCode = normalizeCountryCode\(this\.currentData\?\.countryCode\);/,
+    'auth refresh guard must validate the server countryCode before comparing it',
+  );
+  assert.match(
+    source,
+    /const needsRefresh = !this\.currentData \|\| \(loadedCountryCode !== null && loadedCountryCode !== this\.currentCountryCode\);/,
+    'malformed legacy countryCode values must not cause repeated auth-state refreshes',
+  );
+});
+
 test('getResilienceVisualLevel maps the score thresholds from the widget spec', () => {
   assert.equal(getResilienceVisualLevel(80), 'very_high');
   assert.equal(getResilienceVisualLevel(79), 'high');
@@ -46,6 +82,97 @@ test('getResilienceVisualLevel maps the score thresholds from the widget spec', 
   assert.equal(getResilienceVisualLevel(20), 'low');
   assert.equal(getResilienceVisualLevel(19), 'very_low');
   assert.equal(getResilienceVisualLevel(Number.NaN), 'unknown');
+  assert.equal(getResilienceVisualLevel(-1), 'unknown');
+});
+
+test('getResilienceOverallDisplay treats negative and non-finite scores as insufficient data', () => {
+  assert.deepEqual(getResilienceOverallDisplay({ overallScore: -1, level: 'unknown' }), {
+    hasScore: false,
+    scoreForBar: 0,
+    scoreLabel: 'n/a',
+    visualLevel: 'unknown',
+    visualLevelLabel: 'Insufficient data',
+    serverLevelLabel: 'API level: unknown',
+  });
+  assert.deepEqual(getResilienceOverallDisplay({ overallScore: Number.NaN, level: 'low' }), {
+    hasScore: false,
+    scoreForBar: 0,
+    scoreLabel: 'n/a',
+    visualLevel: 'unknown',
+    visualLevelLabel: 'Insufficient data',
+    serverLevelLabel: 'API level: low',
+  });
+});
+
+test('getResilienceOverallDisplay treats null, undefined, and API unknown zero as no score', () => {
+  assert.equal(hasScoredResilienceOverall(null), false);
+  assert.equal(hasScoredResilienceOverall(undefined), false);
+  assert.equal(hasScoredResilienceOverall({ overallScore: null as unknown as number, level: 'low' }), false);
+  assert.equal(hasScoredResilienceOverall({ overallScore: undefined as unknown as number, level: 'low' }), false);
+  assert.equal(getResilienceVisualLevel(0), 'very_low');
+  assert.deepEqual(getResilienceOverallDisplay({ overallScore: 0, level: 'unknown' }), {
+    hasScore: false,
+    scoreForBar: 0,
+    scoreLabel: 'n/a',
+    visualLevel: 'unknown',
+    visualLevelLabel: 'Insufficient data',
+    serverLevelLabel: 'API level: unknown',
+  });
+});
+
+test('getResilienceOverallDisplay keeps explicit zero scores when API level is real', () => {
+  assert.equal(hasScoredResilienceOverall({ overallScore: 0, level: 'low' }), true);
+  assert.deepEqual(getResilienceOverallDisplay({ overallScore: 0, level: 'low' }), {
+    hasScore: true,
+    scoreForBar: 0,
+    scoreLabel: '0',
+    visualLevel: 'very_low',
+    visualLevelLabel: 'Visual band: VERY LOW',
+    serverLevelLabel: 'API level: low',
+  });
+});
+
+test('getResilienceOverallDisplay distinguishes positive sub-1 scores from explicit zero', () => {
+  assert.equal(hasScoredResilienceOverall({ overallScore: 0.4, level: 'low' }), true);
+  assert.equal(formatScoredResilienceOverallLabel(0), '0');
+  assert.equal(formatScoredResilienceOverallLabel(0.4), '<1');
+  assert.deepEqual(getResilienceOverallDisplay({ overallScore: 0.4, level: 'low' }), {
+    hasScore: true,
+    scoreForBar: 0.4,
+    scoreLabel: '<1',
+    visualLevel: 'very_low',
+    visualLevelLabel: 'Visual band: VERY LOW',
+    serverLevelLabel: 'API level: low',
+  });
+});
+
+test('getResilienceOverallDisplay separates visual band from API level', () => {
+  assert.deepEqual(getResilienceOverallDisplay({ overallScore: 61.2, level: 'medium' }), {
+    hasScore: true,
+    scoreForBar: 61.2,
+    scoreLabel: '61',
+    visualLevel: 'high',
+    visualLevelLabel: 'Visual band: HIGH',
+    serverLevelLabel: 'API level: medium',
+  });
+});
+
+test('resilience methodology help copy derives current counts from the preview fixture', async () => {
+  const { RESILIENCE_DIMENSION_ORDER, RESILIENCE_RETIRED_DIMENSIONS, RESILIENCE_DOMAIN_ORDER } = await import('../server/worldmonitor/resilience/v1/_dimension-scorers.ts');
+  const { PILLAR_ORDER } = await import('../server/worldmonitor/resilience/v1/_pillar-membership.ts');
+  const summary = getResilienceMethodologySummary();
+  assert.deepEqual(summary, {
+    activeDimensionCount: RESILIENCE_DIMENSION_ORDER.length - RESILIENCE_RETIRED_DIMENSIONS.size,
+    serializedDimensionCount: RESILIENCE_DIMENSION_ORDER.length,
+    domainCount: RESILIENCE_DOMAIN_ORDER.length,
+    pillarCount: PILLAR_ORDER.length,
+  });
+
+  const title = formatResilienceMethodologyHelpTitle(summary);
+  assert.match(title, new RegExp(`${summary.activeDimensionCount} active dimensions`));
+  assert.match(title, new RegExp(`${summary.domainCount} domains`));
+  assert.match(title, new RegExp(`${summary.pillarCount} pillars`));
+  assert.match(title, /pillar detail appears when the API response includes it/i);
 });
 
 test('getResilienceTrendArrow renders the expected glyphs', () => {
@@ -109,6 +236,64 @@ test('formatResilienceConfidence: headlineEligible=true is the silent normal cas
   );
 });
 
+test('formatResilienceConfidence derates stale observed coverage like the server', () => {
+  const staleObserved: ResilienceScoreResponse = {
+    ...baseResponse,
+    domains: [
+      { id: 'economic', score: 80, weight: 0.22, dimensions: [
+        {
+          id: 'macroFiscal',
+          score: 80,
+          coverage: 1,
+          observedWeight: 1,
+          imputedWeight: 0,
+          freshness: { lastObservedAtMs: '1717200000000', staleness: 'stale' },
+        },
+        {
+          id: 'currencyExternal',
+          score: 80,
+          coverage: 1,
+          observedWeight: 1,
+          imputedWeight: 0,
+          freshness: { lastObservedAtMs: '1717200000000', staleness: 'fresh' },
+        },
+      ] },
+    ],
+  };
+
+  // Server mirror: (stale 1.0 * 0.4 + fresh 1.0) / 2 = 0.7.
+  assert.equal(formatResilienceConfidence(staleObserved), 'Coverage 70% ✓');
+});
+
+test('formatResilienceConfidence derates aging observed coverage like the server', () => {
+  const agingObserved: ResilienceScoreResponse = {
+    ...baseResponse,
+    domains: [
+      { id: 'economic', score: 80, weight: 0.22, dimensions: [
+        {
+          id: 'macroFiscal',
+          score: 80,
+          coverage: 1,
+          observedWeight: 1,
+          imputedWeight: 0,
+          freshness: { lastObservedAtMs: '1717200000000', staleness: 'aging' },
+        },
+        {
+          id: 'currencyExternal',
+          score: 80,
+          coverage: 1,
+          observedWeight: 1,
+          imputedWeight: 0,
+          freshness: { lastObservedAtMs: '1717200000000', staleness: 'aging' },
+        },
+      ] },
+    ],
+  };
+
+  // Server mirror: aging 1.0 * 0.7 = 0.7.
+  assert.equal(formatResilienceConfidence(agingObserved), 'Coverage 70% ✓');
+});
+
 // PR 3 §3.5 follow-up: retired dimensions (fuelStockDays, post-PR-3)
 // return coverage=0 structurally (by design, not by sparsity) and
 // contribute zero weight to domain scoring. The widget's displayed
@@ -159,6 +344,51 @@ test('formatBaselineStress renders the expected breakdown string (no Impact)', (
   assert.equal(formatBaselineStress(80, 100), 'Baseline: 80 | Stress: 100');
   assert.equal(formatBaselineStress(50, 0), 'Baseline: 50 | Stress: 0');
   assert.equal(formatBaselineStress(NaN, 50), 'Baseline: 0 | Stress: 50');
+});
+
+test('shouldRenderResilienceBaselineStress hides the row when the overall score is unavailable', () => {
+  const noScoreResponse: ResilienceScoreResponse = {
+    ...baseResponse,
+    overallScore: 0,
+    baselineScore: 0,
+    stressScore: 0,
+    level: 'unknown',
+    lowConfidence: true,
+  };
+
+  assert.equal(getResilienceOverallDisplay(noScoreResponse).hasScore, false);
+  assert.equal(shouldRenderResilienceBaselineStress(noScoreResponse), false);
+  assert.equal(formatResilienceConfidence(noScoreResponse), 'Low confidence — sparse data');
+});
+
+test('shouldRenderResilienceBaselineStress keeps explicit zero scores when the API level is real', () => {
+  const zeroScoreResponse: ResilienceScoreResponse = {
+    ...baseResponse,
+    overallScore: 0,
+    baselineScore: 0,
+    stressScore: 0,
+    level: 'low',
+  };
+
+  assert.equal(getResilienceOverallDisplay(zeroScoreResponse).hasScore, true);
+  assert.equal(shouldRenderResilienceBaselineStress(zeroScoreResponse), true);
+});
+
+test('formatResilienceScoreInterval renders the overall score interval badge', () => {
+  assert.deepEqual(formatResilienceScoreInterval({ p05: 65.2, p95: 72.8 }), {
+    label: '[65\u201373]',
+    title: '95% score sensitivity band: 65.2 - 72.8',
+  });
+});
+
+test('formatResilienceScoreInterval omits malformed intervals', () => {
+  assert.equal(formatResilienceScoreInterval(null), null);
+  assert.equal(formatResilienceScoreInterval(undefined), null);
+  assert.equal(formatResilienceScoreInterval({ p05: Number.NaN, p95: 72.8 }), null);
+  assert.equal(formatResilienceScoreInterval({ p05: 65.2, p95: Number.POSITIVE_INFINITY }), null);
+  assert.equal(formatResilienceScoreInterval({ p05: 80, p95: 70 }), null);
+  assert.equal(formatResilienceScoreInterval({ p05: -1, p95: 70 }), null);
+  assert.equal(formatResilienceScoreInterval({ p05: 65.2, p95: 101 }), null);
 });
 
 // T1.4 Phase 1 of the country-resilience reference-grade upgrade plan.
@@ -224,6 +454,7 @@ test('getResilienceDimensionLabel returns short stable labels for all 22 dimensi
   assert.equal(getResilienceDimensionLabel('macroFiscal'), 'Macro');
   assert.equal(getResilienceDimensionLabel('currencyExternal'), 'Currency');
   assert.equal(getResilienceDimensionLabel('tradePolicy'), 'Trade');
+  assert.equal(getResilienceDimensionLabel('financialSystemExposure'), 'Fin. Exposure');
   assert.equal(getResilienceDimensionLabel('cyberDigital'), 'Cyber');
   assert.equal(getResilienceDimensionLabel('logisticsSupply'), 'Logistics');
   assert.equal(getResilienceDimensionLabel('infrastructure'), 'Infra');
@@ -383,9 +614,23 @@ test('collectDimensionConfidences returns an empty list for an empty response', 
 // representative card instead of a blank gap between the domain rows
 // and the footer. If a future edit accidentally drops a dimension
 // from the preview, this regression test fails loudly.
-test('LOCKED_PREVIEW populates all 19 dimensions for the gated preview (PR #2949 review)', () => {
+test('LOCKED_PREVIEW populates all 22 serialized dimensions for the gated preview (PR #2949 review)', async () => {
+  const {
+    RESILIENCE_DIMENSION_ORDER,
+    RESILIENCE_RETIRED_DIMENSIONS,
+  } = await import('../server/worldmonitor/resilience/v1/_dimension-scorers.ts');
+  const retiredDimensions = new Set<string>(RESILIENCE_RETIRED_DIMENSIONS);
   const all = collectDimensionConfidences(LOCKED_PREVIEW.domains);
-  assert.equal(all.length, 19, `locked preview should carry all 19 dimensions, got ${all.length}`);
+  assert.equal(
+    all.length,
+    22,
+    `locked preview should carry all 22 serialized dimensions (20 active + 2 retired), got ${all.length}`,
+  );
+  assert.deepEqual(
+    all.map((dim) => dim.id),
+    RESILIENCE_DIMENSION_ORDER,
+    'locked preview dimension order must match RESILIENCE_DIMENSION_ORDER',
+  );
   // Every cell should resolve to a short label (no raw IDs leaking through).
   for (const dim of all) {
     assert.ok(
@@ -393,14 +638,22 @@ test('LOCKED_PREVIEW populates all 19 dimensions for the gated preview (PR #2949
       `${dim.id} should resolve to a short display label in the preview, got "${dim.label}"`,
     );
   }
-  // Every dimension in the preview should have non-absent status so
-  // the blurred grid renders a meaningful visual, never a row of empty
-  // "n/a" cells.
+  // Every active dimension in the preview should have non-absent status
+  // so the blurred grid renders a meaningful visual. Retired dimensions
+  // deliberately mirror the live retired shape: coverage=0 and absent.
   for (const dim of all) {
+    if (retiredDimensions.has(dim.id)) {
+      assert.equal(
+        dim.status,
+        'absent',
+        `${dim.id} should mirror the live retired zero-coverage shape`,
+      );
+      continue;
+    }
     assert.notEqual(
       dim.status,
       'absent',
-      `${dim.id} should not be absent in the locked preview (all fixture values are populated)`,
+      `${dim.id} should not be absent in the locked preview (active fixture values are populated)`,
     );
   }
 });
@@ -523,6 +776,13 @@ test('getStalenessLabel returns a non-empty string for each level', () => {
     assert.ok(label.length > 0, `${s} should have a tooltip label`);
   }
   assert.ok(getStalenessLabel(null).length > 0);
+});
+
+test('getStalenessIcon gives each visible freshness level a distinct non-color cue', () => {
+  const icons = (['fresh', 'aging', 'stale'] as const).map((s) => getStalenessIcon(s));
+  assert.deepEqual(icons, ['\u25CF', '\u25D0', '\u25CB']);
+  assert.equal(new Set(icons).size, icons.length);
+  assert.equal(getStalenessIcon(null), '');
 });
 
 test('LOCKED_PREVIEW smoke: at least one dimension has imputationClass and one has staleness set (PR 3 / T1.6)', () => {

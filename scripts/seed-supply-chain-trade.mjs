@@ -1,8 +1,16 @@
 #!/usr/bin/env node
 
 import { loadEnvFile, CHROME_UA, runSeed, writeExtraKeyWithMeta, sleep, verifySeedKey, resolveProxyForConnect, fredFetchJson } from './_seed-utils.mjs';
+import { tokensToContentMeta, DAY_MIN } from './_content-age-helpers.mjs';
 
 loadEnvFile(import.meta.url);
+
+// Content-age budget — the canonical key holds the merged shipping indices,
+// whose freshest member (BDI) is daily. 28 days clears a degraded-to-weekly
+// (SCFI/FRED-only) window plus holidays; STALE_CONTENT fires if the whole
+// shipping feed stops advancing. A single-index freeze among many is not
+// modelled — newestItemAt is the max across all indices. See issue #3845.
+const SUPPLY_CHAIN_MAX_CONTENT_AGE_MIN = 28 * DAY_MIN;
 
 const _proxyAuth = resolveProxyForConnect();
 
@@ -62,6 +70,10 @@ const WTO_CODE_TO_ISO2 = { ..._un2iso2 };
 
 function getReporterIso2() {
   return ALL_REPORTERS.map(c => WTO_CODE_TO_ISO2[c]).filter(Boolean);
+}
+
+export function deriveWtoSeverityStatus(value) {
+  return value > 10 ? 'high' : value > 5 ? 'moderate' : 'low';
 }
 
 // ─── Shipping Rates (FRED) ───
@@ -493,7 +505,7 @@ async function fetchTradeBarriers() {
       measureType: gap > 10 ? 'High agricultural protection' : gap > 5 ? 'Moderate agricultural protection' : 'Low tariff gap',
       productDescription: 'Agricultural vs Non-agricultural products',
       objective: gap > 0 ? 'Agricultural sector protection' : 'Uniform tariff structure',
-      status: gap > 10 ? 'high' : gap > 5 ? 'moderate' : 'low',
+      status: deriveWtoSeverityStatus(gap),
       dateDistributed: year, sourceUrl: 'https://stats.wto.org',
     });
   }
@@ -542,7 +554,7 @@ async function fetchTradeRestrictions() {
       reportingCountry: String(row.ReportingEconomy ?? cc),
       affectedCountry: 'All trading partners', productSector: 'All products',
       measureType: 'WTO MFN Baseline', description: `WTO MFN baseline: ${value.toFixed(1)}%`,
-      status: value > 10 ? 'high' : value > 5 ? 'moderate' : 'low',
+      status: deriveWtoSeverityStatus(value),
       notifiedAt: year, sourceUrl: 'https://stats.wto.org',
     };
   }).filter(Boolean).sort((a, b) => {
@@ -776,6 +788,18 @@ export function declareRecords(data) {
   return Array.isArray(data?.indices) ? data.indices.length : 0;
 }
 
+// Content-age contract: newest observation date across every shipping index's
+// accumulated history. See scripts/_content-age-helpers.mjs.
+export function supplyChainContentMeta(data) {
+  const tokens = [];
+  for (const idx of Array.isArray(data?.indices) ? data.indices : []) {
+    for (const h of Array.isArray(idx?.history) ? idx.history : []) {
+      if (h?.date) tokens.push(h.date);
+    }
+  }
+  return tokensToContentMeta(tokens);
+}
+
 // Standalone entrypoint guard. Without this, importing this file from tests
 // kicks off the whole seeder (Redis lock acquisition, external API calls,
 // Redis writes) at module-load time, which hangs the test runner.
@@ -788,6 +812,8 @@ if (process.argv[1]?.endsWith('seed-supply-chain-trade.mjs')) {
     declareRecords,
     schemaVersion: 1,
     maxStaleMin: 420,
+    contentMeta: supplyChainContentMeta,
+    maxContentAgeMin: SUPPLY_CHAIN_MAX_CONTENT_AGE_MIN,
   }).catch((err) => {
     const _cause = err.cause ? ` (cause: ${err.cause.message || err.cause.code || err.cause})` : ''; console.error('FATAL:', (err.message || err) + _cause);
     process.exit(1);

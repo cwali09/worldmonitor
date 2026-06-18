@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 
-import { loadEnvFile, CHROME_UA, getRedisCredentials, runSeed } from './_seed-utils.mjs';
-import { clusterItems, selectTopStories } from './_clustering.mjs';
+import { loadEnvFile, CHROME_UA, getRedisCredentials, runSeed, withRetry, httpRetryError, createLlmBudgetError, isLlmBudgetError } from './_seed-utils.mjs';
+import {
+  clusterItems,
+  computeEntityCorroboration,
+  selectTopStories,
+  DIPLOMACY_KEYWORDS,
+  ENTITY_BIGRAMS,
+} from './_clustering.mjs';
 import { extractCountryCode } from './shared/geo-extract.mjs';
 import { unwrapEnvelope } from './_seed-envelope-source.mjs';
 import { pickBriefCluster, briefSystemPrompt, briefUserPrompt } from './_insights-brief.mjs';
@@ -22,7 +28,12 @@ import { validateNoHallucinatedProperNouns } from './shared/brief-llm-core.js';
 const BRIEF_VALIDATOR_MODE =
   process.env.BRIEF_VALIDATOR_MODE === 'enforce' ? 'enforce' : 'shadow';
 
-loadEnvFile(import.meta.url);
+// True only when run directly as a cron entry (node seed-insights.mjs), false
+// when imported by tests — so importing the module doesn't load .env or fire a
+// live seed. Mirrors seed-forecasts.mjs.
+const _isDirectRun = process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\/g, '/'));
+
+if (_isDirectRun) loadEnvFile(import.meta.url);
 
 const CANONICAL_KEY = 'news:insights:v1';
 const DIGEST_KEY = 'news:digest:v1:full:en';
@@ -76,6 +87,36 @@ function sanitizeTitle(title) {
     .replace(/[\x00-\x1f\x7f]/g, '')
     .slice(0, MAX_HEADLINE_LEN)
     .trim();
+}
+
+function clipText(value, maxLen) {
+  const text = typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
+  return text.length > maxLen ? `${text.slice(0, maxLen - 1).trim()}...` : text;
+}
+
+function normalizeBriefSourceUrl(value) {
+  if (typeof value !== 'string') return '';
+  try {
+    const parsed = new URL(value.trim());
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.toString() : '';
+  } catch {
+    return '';
+  }
+}
+
+function normalizePublishedAt(value) {
+  if (!value) return undefined;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined;
+}
+
+function briefSourceFromStory(story) {
+  const url = normalizeBriefSourceUrl(story?.primaryLink);
+  const title = clipText(story?.primaryTitle, 160);
+  const source = clipText(story?.primarySource, 80);
+  if (!url || !title || !source) return null;
+  const publishedAt = normalizePublishedAt(story?.pubDate);
+  return publishedAt ? { title, source, url, publishedAt } : { title, source, url };
 }
 
 async function readDigestFromRedis() {
@@ -135,9 +176,34 @@ const LLM_PROVIDERS = [
   },
 ];
 
-async function callLLM(headline) {
+// Bounded retry for the brief LLM call. seed-insights holds a 120s seed lock
+// and makes one callLLM per run, so cap total LLM time well under it: honor a
+// provider's Retry-After (429/503) instead of dropping straight to the next
+// provider, but never sleep/fetch past the remaining call budget.
+const INSIGHTS_LLM_MAX_RETRIES = 2;
+const INSIGHTS_LLM_RETRY_BASE_MS = 1_000;
+const INSIGHTS_LLM_RETRY_AFTER_MAX_MS = 10_000;
+const INSIGHTS_LLM_CALL_BUDGET_MS = 60_000;
+const INSIGHTS_LLM_CALL_BUDGET_GUARD_MS = 5_000;
+
+let insightsLlmFetchForTests = null;
+function __setInsightsLlmTransportForTests(overrides = null) {
+  insightsLlmFetchForTests = typeof overrides?.fetch === 'function' ? overrides.fetch : null;
+}
+
+async function callLLM(headline, options = {}) {
   const systemPrompt = briefSystemPrompt(new Date().toISOString().split('T')[0]);
   const userPrompt = briefUserPrompt(headline);
+
+  const insightsFetch = insightsLlmFetchForTests || ((...args) => globalThis.fetch(...args));
+  const callBudgetMs = Number.isFinite(options.callBudgetMs)
+    ? Math.max(0, Math.floor(options.callBudgetMs))
+    : INSIGHTS_LLM_CALL_BUDGET_MS;
+  const retryDelayMs = Number.isFinite(options.retryDelayMs)
+    ? Math.max(0, Math.floor(options.retryDelayMs))
+    : INSIGHTS_LLM_RETRY_BASE_MS;
+  const budgetStartedAtMs = Date.now();
+  const usableBudgetMs = () => Math.max(0, budgetStartedAtMs + callBudgetMs - Date.now() - INSIGHTS_LLM_CALL_BUDGET_GUARD_MS);
 
   for (const provider of LLM_PROVIDERS) {
     const envVal = process.env[provider.envKey];
@@ -147,26 +213,29 @@ async function callLLM(headline) {
     const model = typeof provider.model === 'function' ? provider.model() : provider.model;
 
     try {
-      const resp = await fetch(apiUrl, {
-        method: 'POST',
-        headers: provider.headers(envVal),
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ],
-          max_tokens: 300,
-          temperature: 0.1,
-          ...provider.extraBody,
-        }),
-        signal: AbortSignal.timeout(provider.timeout),
-      });
-
-      if (!resp.ok) {
-        console.warn(`  ${provider.name} API error: ${resp.status}`);
-        continue;
-      }
+      const resp = await withRetry(async () => {
+        const usable = usableBudgetMs();
+        if (usable <= 0) throw createLlmBudgetError('insights llm budget exhausted');
+        const response = await insightsFetch(apiUrl, {
+          method: 'POST',
+          headers: provider.headers(envVal),
+          body: JSON.stringify({
+            model,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ],
+            max_tokens: 300,
+            temperature: 0.1,
+            ...provider.extraBody,
+          }),
+          signal: AbortSignal.timeout(Math.max(1, Math.min(provider.timeout, usable))),
+        });
+        if (!response.ok) {
+          throw httpRetryError(response, { maxRetryAfterMs: INSIGHTS_LLM_RETRY_AFTER_MAX_MS, capMs: usableBudgetMs() });
+        }
+        return response;
+      }, INSIGHTS_LLM_MAX_RETRIES, retryDelayMs);
 
       const json = await resp.json();
       const rawText = json.choices?.[0]?.message?.content?.trim();
@@ -189,6 +258,8 @@ async function callLLM(headline) {
       return { text, model: json.model || model, provider: provider.name };
     } catch (err) {
       console.warn(`  ${provider.name} failed: ${err.message}`);
+      // Budget spent — give up rather than burning the next provider's timeout.
+      if (isLlmBudgetError(err)) return null;
     }
   }
 
@@ -214,6 +285,39 @@ function categorizeStory(title) {
     }
   }
   return { category: 'general', threatLevel: 'moderate' };
+}
+
+function normalizedSignalText(text) {
+  return (text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function clusterHasDiplomacySignal(cluster) {
+  const titles = Array.isArray(cluster.memberTitles) && cluster.memberTitles.length > 0
+    ? cluster.memberTitles
+    : [cluster.primaryTitle];
+  return titles.some((title) => {
+    const text = normalizedSignalText(title);
+    return DIPLOMACY_KEYWORDS.some((kw) => text.includes(kw)) ||
+      ENTITY_BIGRAMS.some(([entity, action]) => text.includes(entity) && text.includes(action));
+  });
+}
+
+function percentile(sortedNumbers, pct) {
+  if (sortedNumbers.length === 0) return 0;
+  const idx = Math.min(sortedNumbers.length - 1, Math.floor((sortedNumbers.length - 1) * pct));
+  return sortedNumbers[idx];
+}
+
+function buildImportanceObservability(clusters, topStories) {
+  const clusterSizes = clusters.map(c => Number(c.sourceCount) || 1).sort((a, b) => a - b);
+  return {
+    llmDrivenRanked: topStories.filter(s => s.threat?.source === 'llm').length,
+    keywordFallbackRanked: topStories.filter(s => s.threat?.source !== 'llm' && !s.upstreamImportanceScore).length,
+    diplomacyHits: clusters.filter(clusterHasDiplomacySignal).length,
+    corroborationHits: clusters.filter(c => c.entityCorroboration === true).length,
+    clusterSizeP50: percentile(clusterSizes, 0.5),
+    clusterSizeP90: percentile(clusterSizes, 0.9),
+  };
 }
 
 async function warmDigestCache() {
@@ -285,6 +389,9 @@ async function fetchInsights() {
     isAlert: item.isAlert || false,
     tier: item.tier,
     threat: normalizeThreat(item.threat),
+    importanceScore: item.importanceScore,
+    corroborationCount: item.corroborationCount ?? item.storyMeta?.sourceCount,
+    storyMeta: item.storyMeta,
   })).filter(item => item.title.length > 10);
 
   const clusters = clusterItems(normalizedItems);
@@ -292,6 +399,15 @@ async function fetchInsights() {
 
   const topStories = selectTopStories(clusters, 8);
   console.log(`  Top stories: ${topStories.length}`);
+  const observability = buildImportanceObservability(clusters, topStories);
+  console.log(
+    `  Importance signals: llm=${observability.llmDrivenRanked} ` +
+      `keywordFallback=${observability.keywordFallbackRanked} ` +
+      `diplomacy=${observability.diplomacyHits} ` +
+      `entityCorroboration=${observability.corroborationHits} ` +
+      `clusterSizeP50=${observability.clusterSizeP50} ` +
+      `clusterSizeP90=${observability.clusterSizeP90}`,
+  );
 
   if (topStories.length === 0) throw new Error('No top stories after scoring');
 
@@ -303,6 +419,7 @@ async function fetchInsights() {
   // matters; the list is already visually marked with per-story sourceCount.
   const briefCluster = pickBriefCluster(topStories);
   const topHeadline = briefCluster ? sanitizeTitle(briefCluster.primaryTitle) : '';
+  const worldBriefSources = briefCluster ? [briefSourceFromStory(briefCluster)].filter(Boolean) : [];
 
   let worldBrief = '';
   let briefProvider = '';
@@ -355,7 +472,7 @@ async function fetchInsights() {
     }
   }
 
-  const multiSourceCount = clusters.filter(c => c.sourceCount >= 2).length;
+  const multiSourceCount = clusters.filter(c => (c.sources?.length ?? 0) >= 2 || c.entityCorroboration === true).length;
   const fastMovingCount = 0; // velocity not available in digest items
 
   const enrichedStories = topStories.map(story => {
@@ -372,7 +489,16 @@ async function fetchInsights() {
       primaryLink: story.primaryLink,
       pubDate: story.pubDate,
       sourceCount: story.sourceCount,
+      uniqueSourceCount: Array.isArray(story.sources) ? story.sources.length : 0,
+      sources: Array.isArray(story.sources) ? story.sources : [],
+      lastUpdated: story.lastUpdated,
+      memberTitles: Array.isArray(story.memberTitles) ? story.memberTitles : [story.primaryTitle],
+      sourceTier: story.sourceTier,
+      upstreamImportanceScore: story.upstreamImportanceScore,
+      entityCorroboration: story.entityCorroboration === true,
+      corroborationSourceCount: story.corroborationSourceCount ?? 0,
       importanceScore: story.importanceScore,
+      effectiveImportanceScore: story.effectiveImportanceScore,
       velocity: { level: 'normal', sourcesPerHour: 0 },
       isAlert: story.isAlert,
       category,
@@ -383,6 +509,7 @@ async function fetchInsights() {
 
   const payload = {
     worldBrief,
+    worldBriefSources,
     briefProvider,
     briefModel,
     status,
@@ -391,6 +518,7 @@ async function fetchInsights() {
     clusterCount: clusters.length,
     multiSourceCount,
     fastMovingCount,
+    importanceSignals: observability,
   };
 
   // LKG preservation: don't overwrite "ok" with "degraded"
@@ -413,16 +541,20 @@ export function declareRecords(data) {
   return Array.isArray(data?.topStories) ? data.topStories.length : 0;
 }
 
-runSeed('news', 'insights', CANONICAL_KEY, fetchInsights, {
-  validateFn: validate,
-  ttlSeconds: CACHE_TTL,
-  sourceVersion: 'digest-clustering-v1',
+export { callLLM, __setInsightsLlmTransportForTests };
 
-  declareRecords,
-  schemaVersion: 1,
-  maxStaleMin: 30,
-}).catch((err) => {
-  const _cause = err.cause ? ` (cause: ${err.cause.message || err.cause.code || err.cause})` : ''; console.error('FATAL:', (err.message || err) + _cause);
-  // Exit gracefully for cron — health endpoint flags stale data via seed-meta.
-  process.exit(0);
-});
+if (_isDirectRun) {
+  runSeed('news', 'insights', CANONICAL_KEY, fetchInsights, {
+    validateFn: validate,
+    ttlSeconds: CACHE_TTL,
+    sourceVersion: 'digest-clustering-v2-importance-diversity',
+
+    declareRecords,
+    schemaVersion: 1,
+    maxStaleMin: 30,
+  }).catch((err) => {
+    const _cause = err.cause ? ` (cause: ${err.cause.message || err.cause.code || err.cause})` : ''; console.error('FATAL:', (err.message || err) + _cause);
+    // Exit gracefully for cron — health endpoint flags stale data via seed-meta.
+    process.exit(0);
+  });
+}

@@ -222,6 +222,8 @@ function makeDeferred() {
 class SseSession {
   constructor(sseUrl, headers) {
     this._sseUrl = sseUrl;
+    this._originHost = new URL(sseUrl).host;
+    this._originProtocol = new URL(sseUrl).protocol;
     this._headers = headers;
     this._endpointUrl = null;
     this._endpointDeferred = makeDeferred();
@@ -245,7 +247,6 @@ class SseSession {
     let buf = '';
     let eventType = '';
     const reader = this._reader;
-    const self = this;
 
     (async () => {
       try {
@@ -253,10 +254,10 @@ class SseSession {
           const { done, value } = await reader.read();
           if (done) {
             // Stream closed — if endpoint never arrived, reject so connect() throws
-            if (!self._endpointUrl) {
-              self._endpointDeferred.reject(new Error('SSE stream closed before endpoint event'));
+            if (!this._endpointUrl) {
+              this._endpointDeferred.reject(new Error('SSE stream closed before endpoint event'));
             }
-            for (const [, d] of self._pending) d.reject(new Error('SSE stream closed'));
+            for (const [, d] of this._pending) d.reject(new Error('SSE stream closed'));
             break;
           }
           buf += dec.decode(value, { stream: true });
@@ -272,27 +273,36 @@ class SseSession {
                 // to prevent SSRF: a malicious server could emit an RFC1918 address.
                 let resolved;
                 try {
-                  resolved = new URL(data.startsWith('http') ? data : data, self._sseUrl);
+                  resolved = new URL(data.startsWith('http') ? data : data, this._sseUrl);
                 } catch {
-                  self._endpointDeferred.reject(new Error('SSE endpoint event contains invalid URL'));
+                  this._endpointDeferred.reject(new Error('SSE endpoint event contains invalid URL'));
                   return;
                 }
                 if (resolved.protocol !== 'https:' && resolved.protocol !== 'http:') {
-                  self._endpointDeferred.reject(new Error('SSE endpoint protocol not allowed'));
+                  this._endpointDeferred.reject(new Error('SSE endpoint protocol not allowed'));
                   return;
                 }
                 if (BLOCKED_HOST_PATTERNS.some(p => p.test(resolved.hostname))) {
-                  self._endpointDeferred.reject(new Error('SSE endpoint host is blocked'));
+                  this._endpointDeferred.reject(new Error('SSE endpoint host is blocked'));
                   return;
                 }
-                self._endpointUrl = resolved.toString();
-                self._endpointDeferred.resolve();
+                // Pin endpoint to the same host as the original SSE URL to
+                // prevent a malicious server from redirecting via the endpoint
+                // event to an internal host (DNS rebinding / SSRF).
+                if (resolved.host !== this._originHost || resolved.protocol !== this._originProtocol) {
+                  this._endpointDeferred.reject(
+                    new Error('SSE endpoint host or protocol does not match origin server'),
+                  );
+                  return;
+                }
+                this._endpointUrl = resolved.toString();
+                this._endpointDeferred.resolve();
               } else {
                 try {
                   const msg = JSON.parse(data);
                   if (msg.id !== undefined) {
-                    const d = self._pending.get(msg.id);
-                    if (d) { self._pending.delete(msg.id); d.resolve(msg); }
+                    const d = this._pending.get(msg.id);
+                    if (d) { this._pending.delete(msg.id); d.resolve(msg); }
                   }
                 } catch { /* skip non-JSON data lines */ }
               }
@@ -301,8 +311,8 @@ class SseSession {
           }
         }
       } catch (err) {
-        self._endpointDeferred.reject(err);
-        for (const [, d] of self._pending) d.reject(new Error('SSE stream closed'));
+        this._endpointDeferred.reject(err);
+        for (const [, d] of this._pending) d.reject(new Error('SSE stream closed'));
       }
     })();
   }
@@ -475,8 +485,9 @@ export default async function handler(req) {
 
   // Per-IP rate limit (#3805). Runs AFTER auth/CORS so unauthenticated and
   // cross-origin callers are still rejected first (cheaper to short-circuit
-  // without a Redis round-trip). On Redis error checkScopedRateLimit
-  // fail-opens — matches checkRateLimit / checkEndpointRateLimit semantics.
+  // without a Redis round-trip). This endpoint is already premium-auth gated,
+  // so Redis-degraded scoped limits intentionally stay availability-first;
+  // checkScopedRateLimit logs/Sentry-captures the degraded path.
   const scoped = await checkScopedRateLimit(RATE_LIMIT_SCOPE, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW, ip);
   if (!scoped.allowed) {
     const retryAfter = Math.max(1, Math.ceil((scoped.reset - Date.now()) / 1000));

@@ -11,8 +11,8 @@ These endpoints are not part of a domain RPC service — they sit at the root of
 
 Single round-trip hydration for the dashboard. Returns **all bootstrap-registered Redis cache keys** unwrapped from their seed envelopes in one response.
 
-- **Auth**: browser origin OR `X-WorldMonitor-Key`
-- **Cache**: `Cache-Control: public, max-age=30, s-maxage=30`
+- **Auth**: browser `wm-session` cookie OR `X-WorldMonitor-Key`
+- **Cache**: the default all-keys response uses `Cache-Control: public, s-maxage=600, stale-while-revalidate=120, stale-if-error=900` plus fast-tier `CDN-Cache-Control`; explicit `?tier=fast` / `?tier=slow` requests use browser `max-age=60` / `max-age=300` and CDN `s-maxage=600` / `s-maxage=7200`.
 - **Shape**: `{ earthquakes, outages, marketQuotes, commodityQuotes, imfMacro, bisPolicy, ... }` — ~40+ top-level fields, each the unwrapped payload of one seeded domain.
 
 Use this on initial page load to avoid 40 parallel RPC calls.
@@ -61,7 +61,9 @@ Internal. Invalidates Redis cache keys by explicit list or glob patterns.
 
 ### `GET /api/health`
 
-Aggregated freshness report for **all registered seed keys**. Returns `HEALTHY`, `WARNING` (stale), or `CRIT` (missing / empty with `emptyDataIsFailure`).
+Aggregated freshness report for **all registered seed keys**. Returns `HEALTHY`, `WARNING`, `DEGRADED`, `UNHEALTHY`, or `REDIS_DOWN` in the JSON `status` field.
+
+All states except `REDIS_DOWN` return HTTP 200; `REDIS_DOWN` returns HTTP 503 because Redis was unreachable and the endpoint could not assess seed state. Responses are not cached (`private, no-store, max-age=0` plus `CDN-Cache-Control: no-store`).
 
 Monitor via UptimeRobot / Better Stack — alert on any status other than `HEALTHY`.
 
@@ -69,9 +71,17 @@ Monitor via UptimeRobot / Better Stack — alert on any status other than `HEALT
 {
   "status": "HEALTHY",
   "checkedAt": "2026-04-19T12:00:00Z",
-  "keys": {
-    "market:stocks-bootstrap:v1": { "status": "HEALTHY", "fetchedAt": "...", "recordCount": 78 },
-    "seismology:earthquakes:v1":  { "status": "WARNING", "staleMin": 12 }
+  "summary": {
+    "total": 194,
+    "ok": 180,
+    "warn": 5,
+    "onDemandWarn": 9,
+    "staleContent": 0,
+    "crit": 0
+  },
+  "checks": {
+    "marketQuotes": { "status": "OK", "records": 78, "seedAgeMin": 12 },
+    "earthquakes": { "status": "OK", "records": 142, "seedAgeMin": 8 }
   }
 }
 ```
@@ -87,6 +97,7 @@ Internal probe that validates each seed producer's envelope shape matches its co
 ## User preferences
 
 ### `GET /api/user-prefs`
+
 ### `POST /api/user-prefs`
 
 Per-user dashboard preferences (layout, toggles, filters). Clerk bearer required. Backed by Convex.
@@ -153,3 +164,10 @@ Public enterprise contact form. Turnstile-verified, rate-limited per IP. Part of
 ### `POST /api/leads/v1/register-interest`
 
 Captures email for Pro-waitlist signup. Writes to Convex and sends a confirmation email. Part of `LeadsService`.
+
+Browser callers must pass Turnstile. Desktop callers using `source: "desktop-settings"` bypass Turnstile only when the request is authenticated with the shared desktop secret:
+
+- `X-WorldMonitor-Desktop-Timestamp`: Unix epoch milliseconds, within 5 minutes of server time.
+- `X-WorldMonitor-Desktop-Signature`: `sha256=<hex HMAC-SHA256>`.
+
+The HMAC input is `<timestamp>\n<canonical JSON>`, where canonical JSON contains `email`, `source`, `appVersion`, `referredBy`, `website`, and `turnstileToken` in that order. Configure `WM_DESKTOP_SHARED_SECRET` on both the desktop sidecar and the cloud API. During rollout, `WM_DESKTOP_AUTH_ALLOW_LEGACY=true` only accepts unsigned legacy desktop requests while the cloud API has no `WM_DESKTOP_SHARED_SECRET` configured. Once the cloud secret is set, desktop requests fail closed unless they include a valid signature, still subject to the tighter desktop rate limit.

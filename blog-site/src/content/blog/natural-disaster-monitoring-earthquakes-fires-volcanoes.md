@@ -1,5 +1,5 @@
 ---
-title: "Earthquake, Fire, Flood: Real-Time Natural Disaster Monitoring with World Monitor"
+title: "Real-Time Natural Disaster Monitoring with World Monitor"
 description: "Track earthquakes, satellite-detected fires, volcanic eruptions, and floods in real time. Free disaster monitoring with geopolitical context on World Monitor."
 metaTitle: "Natural Disaster Monitoring Dashboard | World Monitor"
 keywords: "real-time earthquake map, natural disaster monitoring dashboard, NASA fire detection map, disaster tracking tool free, earthquake volcano flood tracker"
@@ -16,7 +16,7 @@ World Monitor aggregates exactly these data sources into a single, layered view,
 
 ### 1. Earthquakes (USGS)
 
-World Monitor integrates the **U.S. Geological Survey earthquake feed** for all events magnitude 4.5 and above, globally. Each earthquake appears on the map with:
+World Monitor integrates the **[U.S. Geological Survey earthquake feed](https://earthquake.usgs.gov/earthquakes/feed/)** for all events magnitude 4.5 and above, globally. Each earthquake appears on the map with:
 
 - **Magnitude** (size-scaled marker)
 - **Depth** (color-coded: shallow events are more destructive)
@@ -30,7 +30,7 @@ The USGS feed updates within minutes of a seismic event. For major earthquakes, 
 
 ### 2. Satellite Fire Detection (NASA FIRMS / VIIRS)
 
-The **Visible Infrared Imaging Radiometer Suite (VIIRS)** on NASA's Suomi NPP satellite detects thermal anomalies across the planet. World Monitor maps these detections with:
+The **[Visible Infrared Imaging Radiometer Suite (VIIRS)](https://firms.modaps.eosdis.nasa.gov/)** on NASA's Suomi NPP satellite detects thermal anomalies across the planet. World Monitor maps these detections with:
 
 - **Fire Radiative Power (FRP):** How intense is the fire?
 - **Location** with sub-kilometer accuracy

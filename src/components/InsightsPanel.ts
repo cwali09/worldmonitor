@@ -6,10 +6,12 @@ import { signalAggregator, type RegionalConvergence } from '@/services/signal-ag
 import { focalPointDetector } from '@/services/focal-point-detector';
 import { stripOrefLabels } from '@/services/oref-alerts';
 import { ingestNewsForCII, getCountryScore } from '@/services/country-instability';
+import { getCachedCountryScoreValue } from '@/services/cached-risk-scores';
 import { getTheaterPostureSummaries } from '@/services/military-surge';
 import { getCachedPosture } from '@/services/cached-theater-posture';
 import { isMobileDevice } from '@/utils';
-import { escapeHtml, sanitizeUrl } from '@/utils/sanitize';
+import { escapeHtml, sanitizeUrl, unsafeRawHtml } from '@/utils/sanitize';
+import { collectBriefSources, normalizeCachedBriefSources, renderBriefSourcesFooter, type BriefSource } from '@/utils/brief-sources';
 import { SITE_VARIANT } from '@/config';
 import { deletePersistentCache, getPersistentCache, setPersistentCache } from '@/services/persistent-cache';
 import { t } from '@/services/i18n';
@@ -25,9 +27,14 @@ import { getEntityIndex } from '@/services/entity-index';
 
 import type { ClusteredEvent, FocalPoint, MilitaryFlight } from '@/types';
 
+function getAuthoritativeCountryScore(code: string): number | null {
+  return getCachedCountryScoreValue(code) ?? getCountryScore(code);
+}
+
 export class InsightsPanel extends Panel {
   private lastBriefUpdate = 0;
   private cachedBrief: string | null = null;
+  private cachedBriefSources: BriefSource[] = [];
   private lastMissedStories: AnalyzedHeadline[] = [];
   private lastConvergenceZones: RegionalConvergence[] = [];
   private lastFocalPoints: FocalPoint[] = [];
@@ -99,9 +106,15 @@ export class InsightsPanel extends Panel {
 
   private async loadBriefFromCache(): Promise<boolean> {
     if (this.cachedBrief) return false;
-    const entry = await getPersistentCache<{ summary: string }>(InsightsPanel.BRIEF_CACHE_KEY);
+    const entry = await getPersistentCache<{ summary: string; sources?: BriefSource[] }>(InsightsPanel.BRIEF_CACHE_KEY);
     if (!entry?.data?.summary) return false;
+    const { sources, legacySourceShape } = normalizeCachedBriefSources(entry.data, 6);
+    if (legacySourceShape) {
+      void deletePersistentCache(InsightsPanel.BRIEF_CACHE_KEY);
+      return false;
+    }
     this.cachedBrief = entry.data.summary;
+    this.cachedBriefSources = sources;
     this.lastBriefUpdate = entry.updatedAt;
     return true;
   }
@@ -166,7 +179,7 @@ export class InsightsPanel extends Panel {
 
   private setProgress(step: number, total: number, message: string): void {
     const percent = Math.round((step / total) * 100);
-    this.setContent(`
+    this.setSafeContent(unsafeRawHtml(`
       <div class="insights-progress">
         <div class="insights-progress-bar">
           <div class="insights-progress-fill" style="width: ${percent}%"></div>
@@ -176,7 +189,7 @@ export class InsightsPanel extends Panel {
           <span class="insights-progress-message">${message}</span>
         </div>
       </div>
-    `);
+    `, 'legacy Panel.setContent() migration'));
   }
 
   public async updateInsights(clusters: ClusteredEvent[]): Promise<void> {
@@ -204,14 +217,14 @@ export class InsightsPanel extends Panel {
 
     if (clusters.length === 0) {
       this.setDataBadge('unavailable');
-      this.setContent(`<div class="insights-empty">${t('components.insights.waitingForData')}</div>`);
+      this.setSafeContent(unsafeRawHtml(`<div class="insights-empty">${t('components.insights.waitingForData')}</div>`, 'legacy Panel.setContent() migration'));
       return;
     }
 
     // Fallback: full client-side pipeline (skip on mobile — too heavy)
     if (isMobileDevice()) {
       this.setDataBadge('unavailable');
-      this.setContent(`<div class="insights-empty">${t('components.insights.waitingForData')}</div>`);
+      this.setSafeContent(unsafeRawHtml(`<div class="insights-empty">${t('components.insights.waitingForData')}</div>`, 'legacy Panel.setContent() migration'));
       return;
     }
     await this.updateFromClient(clusters, thisGeneration);
@@ -272,11 +285,11 @@ export class InsightsPanel extends Panel {
       const sortedStories = [...serverInsights.topStories].sort((a, b) => {
         const isqA = computeISQ(
           { sourceCount: a.sourceCount, isAlert: a.isAlert, threatLevel: a.threatLevel ?? undefined, countryCode: a.countryCode, velocity: a.velocity },
-          focalFnServer, getCountryScore, isFocalReadyServer,
+          focalFnServer, getAuthoritativeCountryScore, isFocalReadyServer,
         );
         const isqB = computeISQ(
           { sourceCount: b.sourceCount, isAlert: b.isAlert, threatLevel: b.threatLevel ?? undefined, countryCode: b.countryCode, velocity: b.velocity },
-          focalFnServer, getCountryScore, isFocalReadyServer,
+          focalFnServer, getAuthoritativeCountryScore, isFocalReadyServer,
         );
         return isqB.composite - isqA.composite;
       });
@@ -373,17 +386,26 @@ export class InsightsPanel extends Panel {
       const isFocalReady = () => (focalPointDetector.getLastSummary()?.topCountries.some(
         fp => fp.signalCount > 0 || fp.signalTypes.includes('active_strike')
       ) ?? false);
-      const importantItems = this.selectTopStories(clusters, 8, focalFn, getCountryScore, isFocalReady);
+      const importantItems = this.selectTopStories(clusters, 8, focalFn, getAuthoritativeCountryScore, isFocalReady);
       const importantClusters = importantItems.map(({ cluster }) => cluster);
 
       if (importantClusters.length === 0) {
-        this.setContent(`<div class="insights-empty">${t('components.insights.noStories')}</div>`);
+        this.setSafeContent(unsafeRawHtml(`<div class="insights-empty">${t('components.insights.noStories')}</div>`, 'legacy Panel.setContent() migration'));
         return;
       }
 
       // Cap titles sent to AI at 5 to reduce entity conflation in small models
       // Strip OREF translation labels (ALERT[id]:, AREAS[id]:) that may leak into cluster titles
       const titles = importantClusters.slice(0, 5).map(c => stripOrefLabels(c.primaryTitle));
+      const currentBriefSources = collectBriefSources(
+        importantClusters.slice(0, 5).map((cluster) => ({
+          primaryTitle: stripOrefLabels(cluster.primaryTitle),
+          primarySource: cluster.primarySource,
+          primaryLink: cluster.primaryLink,
+          pubDate: cluster.lastUpdated,
+        })),
+        6,
+      );
 
       // Step 2: Analyze sentiment (browser-based, fast)
       this.setProgress(2, totalSteps, t('components.insights.analyzingSentiment'));
@@ -430,8 +452,9 @@ export class InsightsPanel extends Panel {
         if (result) {
           worldBrief = result.summary;
           this.cachedBrief = worldBrief;
+          this.cachedBriefSources = currentBriefSources;
           this.lastBriefUpdate = now;
-          void setPersistentCache(InsightsPanel.BRIEF_CACHE_KEY, { summary: worldBrief });
+          void setPersistentCache(InsightsPanel.BRIEF_CACHE_KEY, { summary: worldBrief, sources: currentBriefSources });
         }
       } else {
         this.setProgress(3, totalSteps, t('components.insights.usingCachedBrief'));
@@ -445,7 +468,12 @@ export class InsightsPanel extends Panel {
 
       if (this.updateGeneration !== thisGeneration) return;
 
-      this.renderInsights(importantItems, sentiments, worldBrief);
+      this.renderInsights(
+        importantItems,
+        sentiments,
+        worldBrief,
+        this.cachedBriefSources.length > 0 ? this.cachedBriefSources : currentBriefSources,
+      );
     } catch (error) {
       console.error('[InsightsPanel] Error:', error);
       this.showError();
@@ -455,10 +483,11 @@ export class InsightsPanel extends Panel {
   private renderInsights(
     items: Array<{ cluster: ClusteredEvent; isq: SignalQuality }>,
     sentiments: Array<{ label: string; score: number }> | null,
-    worldBrief: string | null
+    worldBrief: string | null,
+    worldBriefSources: BriefSource[] = [],
   ): void {
     const clusters = items.map(({ cluster }) => cluster);
-    const briefHtml = worldBrief ? this.renderWorldBrief(worldBrief) : '';
+    const briefHtml = worldBrief ? this.renderWorldBrief(worldBrief, worldBriefSources) : '';
     const focalPointsHtml = this.renderFocalPoints();
     const convergenceHtml = this.renderConvergenceZones();
     const sentimentOverview = this.renderSentimentOverview(sentiments);
@@ -466,7 +495,7 @@ export class InsightsPanel extends Panel {
     const statsHtml = this.renderStats(clusters);
     const missedHtml = this.renderMissedStories();
 
-    this.setContent(`
+    this.setSafeContent(unsafeRawHtml(`
       ${briefHtml}
       ${focalPointsHtml}
       ${convergenceHtml}
@@ -477,14 +506,18 @@ export class InsightsPanel extends Panel {
         ${breakingHtml}
       </div>
       ${missedHtml}
-    `);
+    `, 'legacy Panel.setContent() migration'));
   }
 
   private renderServerInsights(
     insights: ServerInsights,
     sentiments: Array<{ label: string; score: number }> | null,
   ): void {
-    const briefHtml = insights.worldBrief ? this.renderWorldBrief(insights.worldBrief) : '';
+    const worldBriefSources = collectBriefSources(
+      insights.worldBriefSources ?? [],
+      6,
+    );
+    const briefHtml = insights.worldBrief ? this.renderWorldBrief(insights.worldBrief, worldBriefSources) : '';
     const focalPointsHtml = this.renderFocalPoints();
     const convergenceHtml = this.renderConvergenceZones();
     const sentimentOverview = this.renderSentimentOverview(sentiments);
@@ -492,7 +525,7 @@ export class InsightsPanel extends Panel {
     const statsHtml = this.renderServerStats(insights);
     const missedHtml = this.renderMissedStories();
 
-    this.setContent(`
+    this.setSafeContent(unsafeRawHtml(`
       ${briefHtml}
       ${focalPointsHtml}
       ${convergenceHtml}
@@ -503,7 +536,7 @@ export class InsightsPanel extends Panel {
         ${storiesHtml}
       </div>
       ${missedHtml}
-    `);
+    `, 'legacy Panel.setContent() migration'));
   }
 
   private renderServerStories(
@@ -564,7 +597,7 @@ export class InsightsPanel extends Panel {
     `;
   }
 
-  private renderWorldBrief(brief: string): string {
+  private renderWorldBrief(brief: string, sources: BriefSource[] = []): string {
     const heading =
       SITE_VARIANT === 'tech'      ? `🚀 ${t('components.insights.briefTech')}`
     : SITE_VARIANT === 'commodity' ? `⛏️ ${t('components.insights.briefCommodity')}`
@@ -574,6 +607,7 @@ export class InsightsPanel extends Panel {
       <div class="insights-brief">
         <div class="insights-section-title">${heading}</div>
         <div class="insights-brief-text">${escapeHtml(brief)}</div>
+        ${renderBriefSourcesFooter(sources, { className: 'insights-brief-sources' })}
       </div>
     `;
   }
@@ -813,13 +847,13 @@ export class InsightsPanel extends Panel {
   }
 
   private renderDisabledState(): void {
-    this.setContent(`
+    this.setSafeContent(unsafeRawHtml(`
       <div class="insights-disabled">
         <div class="insights-disabled-icon">⚡</div>
         <div class="insights-disabled-title">${t('components.insights.insightsDisabledTitle')}</div>
         <div class="insights-disabled-hint">${t('components.insights.insightsDisabledHint')}</div>
       </div>
-    `);
+    `, 'legacy Panel.setContent() migration'));
   }
 
   private async onAiFlowChanged(): Promise<void> {

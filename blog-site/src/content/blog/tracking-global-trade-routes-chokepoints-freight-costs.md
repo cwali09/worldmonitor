@@ -1,11 +1,12 @@
 ---
-title: "Tracking Global Trade Routes, Chokepoints, and Freight Costs in Real Time"
+title: "Track Trade Routes, Chokepoints, and Freight Costs"
 description: "Track 8 maritime chokepoints, freight indices (BDI, SCFI), trade policy, and critical mineral risks in real time. Free supply chain intelligence dashboard."
-metaTitle: "Real-Time Chokepoint & Freight Index Monitoring | World Monitor"
+metaTitle: "Chokepoint and Freight Index Monitoring | World Monitor"
 keywords: "chokepoint monitoring, Strait of Hormuz shipping, freight index dashboard, BDI Baltic Dry Index, SCFI container rates, supply chain disruption tracker, trade route intelligence"
 audience: "Supply chain professionals, commodity traders, logistics analysts, maritime intelligence, geopolitical risk analysts"
 heroImage: "/blog/images/blog/hormuz-chokepoint-crisis.png"
 pubDate: "2026-03-15"
+modifiedDate: "2026-06-13"
 ---
 
 > **Key Takeaways:** Strait of Hormuz traffic down 94.4%. World Monitor tracks 8 corridors, 9 freight indices, WTO trade policy, and critical mineral concentration across one free dashboard. Data updates in real time.
@@ -118,20 +119,20 @@ Consider the current Hormuz crisis through all four dimensions:
 3. **Trade Policy**: Gulf oil exports affected by the conflict, alternative suppliers face their own trade barriers
 4. **Critical Minerals**: Qatar LNG exports transit Hormuz. Disruption affects downstream petrochemical inputs for battery manufacturing
 
-No single data source shows this full picture. World Monitor puts chokepoint status, freight indices, trade policy, and mineral supply risk in one panel, updated in real time. Combined with [AI-powered forecasting](/blog/posts/prediction-markets-ai-forecasting-geopolitics/), you can see not just what is happening, but where the situation is heading.
+No single data source shows this full picture. World Monitor puts chokepoint status, freight indices, trade policy, and mineral supply risk in one panel, updated in real time. Combined with [AI-powered forecasting](/blog/posts/prediction-markets-ai-forecasting-geopolitics/), you can see not just what is happening, but where the situation is heading. And if you want these signals in your own systems rather than a dashboard, the API exposes the same data: here is [how to build a supply-chain early-warning system](/blog/posts/build-supply-chain-early-warning-system-api/) with route scoring and disruption webhooks.
 
 ## The Data Sources
 
 Transparency matters. Here is where the data comes from:
 
 - **Vessel transit data**: AIS (Automatic Identification System) feeds, cross-referenced with historical baselines
-- **Conflict events**: ACLED (Armed Conflict Location & Event Data Project), 7-day rolling windows
+- **Conflict events**: [ACLED](https://acleddata.com/) (Armed Conflict Location & Event Data Project), 7-day rolling windows
 - **Shipping advisories**: AI-generated from combined conflict, navigational, and AIS disruption signals
-- **Container indices**: Shanghai Shipping Exchange (SSE) public JSON API
-- **Bulk indices**: Baltic Exchange via HandyBulk daily reports
-- **Economic indices**: FRED (Federal Reserve Economic Data)
-- **Trade policy**: WTO I-TIP (Integrated Trade Intelligence Portal)
-- **Critical minerals**: USGS mineral commodity data with HHI calculations
+- **Container indices**: [Shanghai Shipping Exchange (SSE)](https://en.sse.net.cn/) public JSON API
+- **Bulk indices**: [Baltic Exchange](https://www.balticexchange.com/) via HandyBulk daily reports
+- **Economic indices**: [FRED](https://fred.stlouisfed.org/) (Federal Reserve Economic Data)
+- **Trade policy**: [WTO I-TIP](https://i-tip.wto.org/) (Integrated Trade Intelligence Portal)
+- **Critical minerals**: [USGS](https://www.usgs.gov/centers/national-minerals-information-center) mineral commodity data with HHI calculations
 
 All sources are public. No proprietary data feeds. No paywall.
 

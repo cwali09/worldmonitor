@@ -24,14 +24,17 @@ import {
 } from './_digest-markdown.mjs';
 
 const require = createRequire(import.meta.url);
+const DIGEST_DIPLOMACY_DATA = require('../shared/diplomacy-keywords.json');
 const { decrypt } = require('./lib/crypto.cjs');
 const { callLLM } = require('./lib/llm-chain.cjs');
 const { fetchUserPreferences, extractUserContext, formatUserProfile } = require('./lib/user-context.cjs');
+const { fetchFollowedCountries } = require('./lib/followed-countries-fetch.cjs');
 const { Resend } = require('resend');
 const { normalizeResendSender } = require('./lib/resend-from.cjs');
 import { readRawJsonFromUpstash, redisPipeline } from '../api/_upstash-json.js';
 import { classifyOpinion } from '../server/_shared/opinion-classifier.js';
 import { classifyFeelGood } from '../server/_shared/feelgood-classifier.js';
+import { classifyEphemeralLiveCoverage } from '../shared/ephemeral-live-classifier.js';
 import {
   composeBriefFromDigestStories,
   compareRules,
@@ -79,6 +82,17 @@ import { readCooldownConfig } from './lib/digest-cooldown-config.mjs';
 import { evaluateCooldown } from './lib/digest-cooldown-decision.mjs';
 import { emitCooldownShadowLog } from './lib/digest-cooldown-shadow-log.mjs';
 
+const EPHEMERAL_LIVE_LOG_TITLE_SAMPLE_LIMIT = 5;
+const EPHEMERAL_LIVE_LOG_TITLE_MAX_CHARS = 160;
+
+function compactDroppedEphemeralLiveTitle(title) {
+  const compact = String(title ?? '').replace(/\s+/g, ' ').trim();
+  if (!compact) return '<missing title>';
+  return compact.length > EPHEMERAL_LIVE_LOG_TITLE_MAX_CHARS
+    ? `${compact.slice(0, EPHEMERAL_LIVE_LOG_TITLE_MAX_CHARS - 3)}...`
+    : compact;
+}
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL ?? '';
@@ -100,6 +114,10 @@ const RESEND_FROM =
     process.env.RESEND_FROM_BRIEF ?? process.env.RESEND_FROM_EMAIL,
     'WorldMonitor Brief',
   ) ?? 'WorldMonitor Brief <brief@worldmonitor.app>';
+const DIGEST_LAST_RUN_KEY = 'digest:last-run';
+const DIGEST_LAST_RUN_META_KEY = 'seed-meta:digest:last-run';
+const DIGEST_LAST_RUN_TTL_SECONDS = 7 * 24 * 60 * 60;
+let digestRunStartedAtMs = null;
 
 if (process.env.DIGEST_CRON_ENABLED === '0') {
   console.log('[digest] DIGEST_CRON_ENABLED=0 — skipping run');
@@ -167,6 +185,18 @@ const BRIEF_SIGNING_SECRET_MISSING =
 // toggled independently (e.g. kill the brief LLM without silencing
 // the email's AI summary during a provider outage).
 const BRIEF_LLM_ENABLED = process.env.BRIEF_LLM_ENABLED !== '0';
+
+// Free-tier follow limit (PR C / U10). Mirrors the UI cap at
+// `src/components/FollowCountryButton.ts` and the server-side mutation
+// cap at `convex/followedCountries.ts::followCountry`. Three layers
+// total — UI / mutation / composer — per the
+// `paywalled-feature-needs-three-layer-entitlement-gate` pattern. The
+// composer clamp catches the post-downgrade case: a user accumulated
+// >3 follows as Pro then downgraded to free; existing rows are
+// grandfathered (mutation only blocks NEW writes), but the composer
+// must still bias only the first 3 in addedAt order so the soft uplift
+// matches what's gated.
+const FREE_TIER_FOLLOW_LIMIT = 3;
 
 // Phase 3c — analyst-backed whyMatters enrichment via an internal Vercel
 // edge endpoint. When the endpoint is reachable + returns a string, it
@@ -321,6 +351,45 @@ async function upstashPipeline(commands) {
   return res.json();
 }
 
+function compactDigestLastRunReason(reason) {
+  return String(reason ?? 'unknown').replace(/\s+/g, ' ').trim().slice(0, 240);
+}
+
+async function writeDigestLastRunMeta({
+  startedAtMs,
+  finishedAtMs = Date.now(),
+  status = 'ok',
+  sentCount = 0,
+  errorReason = null,
+}) {
+  const run = {
+    fetchedAt: finishedAtMs,
+    recordCount: 1,
+    status,
+    sentCount,
+    startedAt: startedAtMs,
+    durationMs: Math.max(0, finishedAtMs - startedAtMs),
+  };
+  if (errorReason) run.errorReason = compactDigestLastRunReason(errorReason);
+
+  try {
+    const result = await upstashPipeline([
+      ['SET', DIGEST_LAST_RUN_KEY, JSON.stringify(run), 'EX', String(DIGEST_LAST_RUN_TTL_SECONDS)],
+      ['SET', DIGEST_LAST_RUN_META_KEY, JSON.stringify(run), 'EX', String(DIGEST_LAST_RUN_TTL_SECONDS)],
+    ]);
+    const ok = Array.isArray(result)
+      && result.length === 2
+      && result.every((cell) => cell && typeof cell === 'object' && !('error' in cell));
+    if (!ok) {
+      console.warn('[digest] last-run health write did not confirm both keys');
+    }
+    return ok;
+  } catch (err) {
+    console.warn(`[digest] last-run health write failed: ${err?.message ?? err}`);
+    return false;
+  }
+}
+
 // ── Schedule helpers ──────────────────────────────────────────────────────────
 
 function toLocalHour(nowMs, timezone) {
@@ -446,6 +515,63 @@ function matchesSensitivity(ruleSensitivity, severity) {
   return severity === 'critical';
 }
 
+const DIGEST_DIPLOMACY_KEYWORDS = DIGEST_DIPLOMACY_DATA.diplomacyKeywords;
+const DIGEST_FLASHPOINT_KEYWORDS = DIGEST_DIPLOMACY_DATA.flashpointKeywords;
+const DIGEST_DIPLOMACY_FLASHPOINT_PAIRS = DIGEST_DIPLOMACY_DATA.diplomacyFlashpointPairs;
+
+function digestSignalText(text) {
+  return String(text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// Word-start containment in digest-normalized text. Mirrors
+// shared/brief-filter.js:containsKeywordToken — prevents 'pact' inside
+// 'impact' (false positive) while still matching 'iran' inside
+// 'iranian' (demonym preserved). PR #3909 review (P2).
+function digestContainsKeywordToken(text, kw) {
+  if (!kw) return false;
+  const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|\\s)${escaped}`).test(text);
+}
+
+function digestHasDiplomacyFlashpointSignal(title) {
+  const text = digestSignalText(title);
+  if (
+    DIGEST_DIPLOMACY_FLASHPOINT_PAIRS.some(([entity, action]) =>
+      digestContainsKeywordToken(text, entity) && digestContainsKeywordToken(text, action),
+    )
+  ) {
+    return true;
+  }
+  return DIGEST_DIPLOMACY_KEYWORDS.some((kw) => digestContainsKeywordToken(text, kw)) &&
+    DIGEST_FLASHPOINT_KEYWORDS.some((kw) => digestContainsKeywordToken(text, kw));
+}
+
+function digestPercentile(sortedNumbers, pct) {
+  if (sortedNumbers.length === 0) return 0;
+  const idx = Math.min(sortedNumbers.length - 1, Math.floor((sortedNumbers.length - 1) * pct));
+  return sortedNumbers[idx];
+}
+
+function logDigestImportanceObservability(stories, { variant, lang, sensitivity }) {
+  if (!Array.isArray(stories) || stories.length === 0) return;
+  const clusterSizes = stories
+    .map((s) => Array.isArray(s.mergedHashes) && s.mergedHashes.length > 0 ? s.mergedHashes.length : 1)
+    .sort((a, b) => a - b);
+  const diplomacyHits = stories.filter((s) => digestHasDiplomacyFlashpointSignal(s.title)).length;
+  const corroborationHits = stories.filter((s) =>
+    (Array.isArray(s.sources) && s.sources.length >= 2) ||
+    (Array.isArray(s.mergedHashes) && s.mergedHashes.length >= 2)
+  ).length;
+  if (diplomacyHits === 0 && corroborationHits === 0) return;
+  console.log(
+    `[digest] buildDigest importance signals variant=${variant} lang=${lang} ` +
+      `sensitivity=${sensitivity} diplomacy=${diplomacyHits} ` +
+      `corroboration=${corroborationHits} ` +
+      `clusterSizeP50=${digestPercentile(clusterSizes, 0.5)} ` +
+      `clusterSizeP90=${digestPercentile(clusterSizes, 0.9)}`,
+  );
+}
+
 // ── Digest content ────────────────────────────────────────────────────────────
 
 // Dedup lives in scripts/lib/brief-dedup.mjs (orchestrator) with the
@@ -488,6 +614,8 @@ async function buildDigest(rule, windowStartMs) {
   let droppedStaleAtRead = 0;
   let droppedOpinion = 0;
   let droppedFeelGood = 0;
+  let droppedEphemeralLive = 0;
+  const droppedEphemeralLiveTitleSamples = [];
   for (let i = 0; i < hashes.length; i++) {
     const raw = trackResults[i]?.result;
     if (!Array.isArray(raw) || raw.length === 0) continue;
@@ -550,6 +678,30 @@ async function buildDigest(rule, windowStartMs) {
       continue;
     }
 
+    // Ephemeral live-programming exclusion. This is intentionally a digest/
+    // brief read-path filter, not a global news-feed drop: live video teasers
+    // can be acceptable inside a live news surface, but a delayed daily brief
+    // should not tell readers hours later to "WATCH LIVE" a briefing that may
+    // address something.
+    const stampedEphemeralLive = track.isEphemeralLiveCoverage === '1';
+    const ephemeralLiveStampMissing =
+      typeof track.isEphemeralLiveCoverage !== 'string' ||
+      track.isEphemeralLiveCoverage.length === 0;
+    if (
+      stampedEphemeralLive ||
+      (ephemeralLiveStampMissing && classifyEphemeralLiveCoverage({
+        title: track.title,
+        link: track.link ?? '',
+        description: typeof track.description === 'string' ? track.description : '',
+      }))
+    ) {
+      droppedEphemeralLive++;
+      if (droppedEphemeralLiveTitleSamples.length < EPHEMERAL_LIVE_LOG_TITLE_SAMPLE_LIMIT) {
+        droppedEphemeralLiveTitleSamples.push(compactDroppedEphemeralLiveTitle(track.title));
+      }
+      continue;
+    }
+
     const phase = derivePhase(track);
     if (phase === 'fading') continue;
     if (!matchesSensitivity(rule.sensitivity ?? 'high', track.severity)) continue;
@@ -575,6 +727,12 @@ async function buildDigest(rule, windowStartMs) {
       // pre-stamp residue rows. Display-side word-wise titleCase happens
       // once at the envelope-build site in shared/brief-filter.js.
       category: typeof track.category === 'string' ? track.category : '',
+      // Cross-title entity corroboration persisted by list-feed-digest.
+      // This is distinct from exact-title source sets: the brief composer
+      // uses it only for the narrow lead/card coherence override when
+      // the LLM's top-ranked story is a corroborated flashpoint-diplomacy
+      // development.
+      entityCorroborationCount: parseInt(track.entityCorroborationCount ?? '0', 10) || 0,
     });
   }
 
@@ -599,6 +757,18 @@ async function buildDigest(rule, windowStartMs) {
       `[digest] buildDigest feel-good filter dropped ${droppedFeelGood} ` +
         `feel-good/lifestyle item(s) from the pool (variant=${rule.variant ?? 'full'} ` +
         `lang=${rule.lang ?? 'en'} sensitivity=${rule.sensitivity ?? 'high'})`,
+    );
+  }
+
+  if (droppedEphemeralLive > 0) {
+    const titleSampleSuffix = droppedEphemeralLiveTitleSamples.length > 0
+      ? ` sample_titles=${JSON.stringify(droppedEphemeralLiveTitleSamples)}`
+      : '';
+    console.log(
+      `[digest] buildDigest ephemeral-live filter dropped ${droppedEphemeralLive} ` +
+        `live-programming teaser(s) from the pool (variant=${rule.variant ?? 'full'} ` +
+        `lang=${rule.lang ?? 'en'} sensitivity=${rule.sensitivity ?? 'high'})` +
+        titleSampleSuffix,
     );
   }
 
@@ -763,6 +933,12 @@ async function buildDigest(rule, windowStartMs) {
   // have RESET (top[i].sources = []) and re-fetched, doubling the
   // SMEMBERS pipeline cost per tick for no functional benefit.
 
+  logDigestImportanceObservability(top, {
+    variant,
+    lang,
+    sensitivity: rule.sensitivity ?? 'high',
+  });
+
   return top;
 }
 
@@ -918,7 +1094,7 @@ function formatDigestHtml(stories, nowMs) {
       </table>
       ${sectionsHtml}
       <div style="text-align: center; padding: 12px 0 36px;">
-        <a href="https://worldmonitor.app" style="display: inline-block; background: #4ade80; color: #0a0a0a; padding: 12px 32px; text-decoration: none; font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: 1.5px; border-radius: 3px;">Open Dashboard</a>
+        <a href="https://worldmonitor.app/dashboard" style="display: inline-block; background: #4ade80; color: #0a0a0a; padding: 12px 32px; text-decoration: none; font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: 1.5px; border-radius: 3px;">Open Dashboard</a>
       </div>
     </div>
     <div style="background: #0a0a0a; border-top: 1px solid #1a1a1a; padding: 20px 36px; text-align: center;">
@@ -1316,11 +1492,28 @@ async function sendWebhook(userId, webhookEnvelope, stories, aiSummary) {
 
 // ── Entitlement check ────────────────────────────────────────────────────────
 
-async function isUserPro(userId) {
+/**
+ * Resolve the caller's entitlement tier (0 = free, 1 = pro, etc).
+ * Reads the relay:entitlement:{userId} cache first; falls back to the
+ * /relay/entitlement HTTP action and back-fills the cache.
+ *
+ * Failure mode: returns `null` when neither cache nor relay yields a
+ * usable number. Callers MUST treat null as "unknown" — never "free"
+ * — so a transient relay outage doesn't accidentally clamp legitimate
+ * paying users out of paywalled affordances. The digest cron's
+ * `isUserPro` uses null → fail-open (true); the followed-country
+ * composer clamp uses null → "skip clamp" (treat as Pro for the
+ * duration of the outage). Same fail-open polarity in both call
+ * sites, but explicit so future readers can audit the choice.
+ */
+async function getUserTier(userId) {
   const cacheKey = `relay:entitlement:${userId}`;
   try {
     const cached = await upstashRest('GET', cacheKey);
-    if (cached !== null) return Number(cached) >= 1;
+    if (cached !== null) {
+      const n = Number(cached);
+      if (Number.isFinite(n)) return n;
+    }
   } catch { /* miss */ }
   try {
     const res = await fetch(`${CONVEX_SITE_URL}/relay/entitlement`, {
@@ -1329,13 +1522,20 @@ async function isUserPro(userId) {
       body: JSON.stringify({ userId }),
       signal: AbortSignal.timeout(5000),
     });
-    if (!res.ok) return true; // fail-open
+    if (!res.ok) return null; // unknown — caller decides fail-open polarity
     const { tier } = await res.json();
-    await upstashRest('SET', cacheKey, String(tier ?? 0), 'EX', String(ENTITLEMENT_CACHE_TTL));
-    return (tier ?? 0) >= 1;
+    const safeTier = Number.isFinite(tier) ? tier : 0;
+    await upstashRest('SET', cacheKey, String(safeTier), 'EX', String(ENTITLEMENT_CACHE_TTL));
+    return safeTier;
   } catch {
-    return true; // fail-open
+    return null;
   }
+}
+
+async function isUserPro(userId) {
+  const tier = await getUserTier(userId);
+  if (tier === null) return true; // fail-open — preserve historic polarity
+  return tier >= 1;
 }
 
 // ── Per-channel body composition ─────────────────────────────────────────────
@@ -1420,7 +1620,8 @@ function injectBriefCta(html, magazineUrl) {
 // ── Brief composition (runs once per cron tick, before digest loop) ─────────
 
 /**
- * Write brief:{userId}:{issueDate} for every eligible user and
+ * Write brief:{userId}:{issueSlot} for every eligible user and
+ * brief:latest:{userId} as the latest-pointer for share/readback, then
  * return { briefByUser, counters } for the digest loop + main's
  * end-of-run exit gate. One brief per user regardless of how many
  * variants they have enabled.
@@ -1660,6 +1861,32 @@ async function composeAndStoreBriefForUser(userId, annotated, insightsNumbers, d
     }
   }
 
+  // PR C / U10: fetch the user's followed-countries watchlist, then
+  // apply the free-tier safety-net clamp. Three-layer gate: UI cap
+  // (FollowCountryButton) + mutation cap (followedCountries.ts) +
+  // this composer clamp (post-downgrade safety). Memory:
+  // `paywalled-feature-needs-three-layer-entitlement-gate`.
+  //
+  // Failure modes are absorbed by fetchFollowedCountries (it returns
+  // [] on any soft error, never throws) — the bias is purely an
+  // uplift, so missing data degrades to today's behavior, not to a
+  // wrong brief.
+  let followedCountriesUsed = [];
+  try {
+    const followed = await fetchFollowedCountries(userId);
+    if (followed.length > 0) {
+      const tier = await getUserTier(userId);
+      // tier === null (relay unreachable) → fail-open: skip the clamp,
+      // honor the user's full followed list. Same polarity as
+      // isUserPro's fail-open (true = Pro). A transient outage must
+      // not silently demote a paying user's bias.
+      const isFree = tier !== null && tier < 1;
+      followedCountriesUsed = isFree ? followed.slice(0, FREE_TIER_FOLLOW_LIMIT) : followed;
+    }
+  } catch (err) {
+    console.warn(`[digest] brief: followed-countries fetch threw for ${userId}:`, err?.message);
+  }
+
   // Compose envelope with synthesis pre-baked. The composer applies
   // severity/topic-cluster ordering BEFORE the cap, with
   // rankedStoryHashes only as a tie-breaker inside similarly severe
@@ -1672,7 +1899,11 @@ async function composeAndStoreBriefForUser(userId, annotated, insightsNumbers, d
     cap: 0,
     source_topic_cap: 0,
     institutional_static_page: 0,
+    ephemeral_live: 0,
     in: winnerStories.length,
+  };
+  const orderStats = {
+    leadDiplomacyOverride: false,
   };
   const envelope = composeBriefFromDigestStories(
     winner.rule,
@@ -1681,6 +1912,7 @@ async function composeAndStoreBriefForUser(userId, annotated, insightsNumbers, d
     {
       nowMs,
       onDrop: (ev) => { dropStats[ev.reason] = (dropStats[ev.reason] ?? 0) + 1; },
+      onOrder: (ev) => { orderStats.leadDiplomacyOverride = ev.leadDiplomacyOverride === true; },
       synthesis: synthesis || publicLead
         ? {
             ...(synthesis ?? {}),
@@ -1689,8 +1921,23 @@ async function composeAndStoreBriefForUser(userId, annotated, insightsNumbers, d
             publicThreads: publicLead?.threads ?? undefined,
           }
         : undefined,
+      followedCountries: followedCountriesUsed,
     },
   );
+
+  // Operator-visible signal that the followed-country bias did
+  // (or did not) participate in this user's compose. Distinct log
+  // line so the brief-filter-drops grep stays clean. Captures the
+  // clamped list (post free-tier truncation) so an operator
+  // reading the log can recompute "why was this story boosted".
+  // Empty list → no-op (and we don't log to keep volume sane).
+  if (followedCountriesUsed.length > 0) {
+    console.log(
+      `[digest] brief followed-bias user=${userId} ` +
+        `count=${followedCountriesUsed.length} ` +
+        `countries=${followedCountriesUsed.join(',')}`,
+    );
+  }
 
   // Per-attempt filter-drop line for the winning candidate. Same
   // shape today's log emits — operators can keep their existing
@@ -1711,6 +1958,7 @@ async function composeAndStoreBriefForUser(userId, annotated, insightsNumbers, d
       `dropped_cap=${dropStats.cap} ` +
       `dropped_source_topic_cap=${dropStats.source_topic_cap} ` +
       `dropped_institutional_static_page=${dropStats.institutional_static_page} ` +
+      `dropped_ephemeral_live=${dropStats.ephemeral_live} ` +
       `out=${out}`,
   );
 
@@ -1745,9 +1993,13 @@ async function composeAndStoreBriefForUser(userId, annotated, insightsNumbers, d
     // the wrong fit here: a single headline can carry ≥4 anchors,
     // tripping its size-based threshold up to 2.
     const coherent = leadGroundsAgainstStory(synthesis.lead, card1Headline);
+    const coherentVia = !coherent
+      ? 'mismatch'
+      : (orderStats.leadDiplomacyOverride ? 'lead_diplomacy_override' : 'natural');
     console.log(
       `[digest] lead card1 coherence user=${userId} ` +
         `coherent=${coherent} synthesis_level=${synthesisLevel} ` +
+        `coherent_via=${coherentVia} ` +
         `card1_clusterId=${card1?.clusterId ?? '?'}`,
     );
     if (!coherent) {
@@ -1890,6 +2142,7 @@ async function composeAndStoreBriefForUser(userId, annotated, insightsNumbers, d
 
 async function main() {
   const nowMs = Date.now();
+  digestRunStartedAtMs = nowMs;
   console.log('[digest] Cron run start:', new Date(nowMs).toISOString());
 
   let rules;
@@ -1904,16 +2157,27 @@ async function main() {
     });
     if (!res.ok) {
       console.error('[digest] Failed to fetch rules:', res.status);
+      await writeDigestLastRunMeta({
+        startedAtMs: nowMs,
+        status: 'error',
+        errorReason: `fetch_rules_http_${res.status}`,
+      });
       return;
     }
     rules = await res.json();
   } catch (err) {
     console.error('[digest] Fetch rules failed:', err.message);
+    await writeDigestLastRunMeta({
+      startedAtMs: nowMs,
+      status: 'error',
+      errorReason: `fetch_rules_failed:${err.message}`,
+    });
     return;
   }
 
   if (!Array.isArray(rules) || rules.length === 0) {
     console.log('[digest] No digest rules found — nothing to do');
+    await writeDigestLastRunMeta({ startedAtMs: nowMs, sentCount: 0 });
     return;
   }
 
@@ -1951,6 +2215,7 @@ async function main() {
       console.warn(
         `[digest] No rules matched userId=${onlyUserFilter.userId} — nothing to do (exiting green).`,
       );
+      await writeDigestLastRunMeta({ startedAtMs: nowMs, sentCount: 0 });
       return;
     }
   } else if (onlyUserFilter.kind === 'reject') {
@@ -2724,11 +2989,26 @@ async function main() {
     console.warn(
       `[digest] brief: exiting non-zero — compose_failed=${composeFailed} compose_success=${composeSuccess} crossed the threshold`,
     );
+    await writeDigestLastRunMeta({
+      startedAtMs: nowMs,
+      status: 'error',
+      sentCount,
+      errorReason: `brief_compose_failed:${composeFailed}:success:${composeSuccess}`,
+    });
     process.exit(1);
   }
+
+  await writeDigestLastRunMeta({ startedAtMs: nowMs, sentCount });
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
+  const finishedAtMs = Date.now();
   console.error('[digest] Fatal:', err);
+  await writeDigestLastRunMeta({
+    startedAtMs: digestRunStartedAtMs ?? finishedAtMs,
+    finishedAtMs,
+    status: 'error',
+    errorReason: `fatal:${err?.message ?? err}`,
+  });
   process.exit(1);
 });

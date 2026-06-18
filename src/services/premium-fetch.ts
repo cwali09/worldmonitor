@@ -21,8 +21,7 @@
  *      With no key present it returns { valid: false, required: true } →
  *      gateway emits 401.
  *
- * Net effect: Pro users on subdomains whose localStorage didn't carry a
- * tester key got 401s on FRED + BLS + BIS etc., while anon users (whose
+ * Net effect: Pro users without a tester session got 401s on FRED + BLS + BIS etc., while anon users (whose
  * premiumFetch falls through to globalThis.fetch and the interceptor
  * attaches wms_) saw the data normally — the inverse of the expected
  * "Pro sees more" behaviour.
@@ -32,7 +31,7 @@
  * API-key holders (step 1) and tester-key holders (step 2) are unaffected
  * — those keys travel via X-WorldMonitor-Key which works on any path.
  */
-import * as Sentry from '@sentry/browser';
+import { enqueueSentryCall } from '@/bootstrap/sentry-defer';
 import { PREMIUM_RPC_PATHS } from '@/shared/premium-paths';
 
 /**
@@ -43,6 +42,7 @@ let _testProviders: {
   getTesterKey?: () => string;
   getTesterKeys?: () => string[];
   getClerkToken?: () => Promise<string | null>;
+  isClerkUserSignedIn?: () => boolean | Promise<boolean>;
 } | null = null;
 
 export function _setTestProviders(
@@ -56,12 +56,22 @@ function reportServerError(res: Response, input: RequestInfo | URL): void {
   try {
     const href = input instanceof Request ? input.url : String(input);
     const path = new URL(href, globalThis.location?.href ?? 'https://worldmonitor.app').pathname;
-    Sentry.captureMessage(`API ${res.status}: ${path}`, {
-      level: 'error',
-      tags: { kind: 'api_5xx' },
-      extra: { path, status: res.status },
-    });
+    // Cloudflare edge errors (520-527) are CDN<->origin transport failures, not
+    // origin application errors — a single one is a transient blip. Capture at
+    // `warning` so a sustained outage still escalates by volume without a lone
+    // transient drowning genuine origin 5xx in the error dashboard
+    // (WORLDMONITOR-RG). Genuine origin 5xx (500-511) stay at `error`.
+    const isCloudflareEdgeError = res.status >= 520 && res.status <= 527;
+    const message = `API ${res.status}: ${path}`;
+    const level: 'warning' | 'error' = isCloudflareEdgeError ? 'warning' : 'error';
+    const tags = { kind: isCloudflareEdgeError ? 'api_cf_5xx' : 'api_5xx' };
+    const extra = { path, status: res.status };
+    enqueueSentryCall((s) => s.captureMessage(message, { level, tags, extra }));
   } catch { /* ignore URL parse errors */ }
+}
+
+function withCredentials(init?: RequestInit): RequestInit {
+  return { ...(init ?? {}), credentials: init?.credentials ?? 'include' };
 }
 
 /**
@@ -111,6 +121,44 @@ async function loadTesterKeys(): Promise<string[]> {
   }
 }
 
+// Delay before the single Clerk-token retry (see step 3 in premiumFetch).
+// Long enough for the boot-window token-generation rotation to settle, short
+// enough to stay imperceptible on the one premium call that loses the race.
+const CLERK_TOKEN_RETRY_DELAY_MS = 300;
+
+async function resolveClerkToken(): Promise<string | null> {
+  if (_testProviders) {
+    return _testProviders.getClerkToken ? _testProviders.getClerkToken() : null;
+  }
+  const { getClerkToken } = await import('@/services/clerk');
+  return getClerkToken();
+}
+
+/**
+ * Whether a Clerk user is currently present. Gates the token retry: a present
+ * user means a null token is a transient boot-window artifact worth retrying;
+ * an absent user means a genuinely anonymous visitor who must NOT pay the
+ * retry delay and should fall through immediately.
+ */
+async function isClerkUserSignedIn(): Promise<boolean> {
+  if (_testProviders) {
+    return (await _testProviders.isClerkUserSignedIn?.()) ?? false;
+  }
+  try {
+    const { getCurrentClerkUser } = await import('@/services/clerk');
+    return getCurrentClerkUser() !== null;
+  } catch {
+    return false;
+  }
+}
+
+function delayBeforeClerkRetry(): Promise<void> {
+  // Test providers stand in for the real Clerk session, so never block the
+  // suite on a real timer.
+  const ms = _testProviders ? 0 : CLERK_TOKEN_RETRY_DELAY_MS;
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
 export async function premiumFetch(
   input: RequestInfo | URL,
   init?: RequestInit,
@@ -118,7 +166,7 @@ export async function premiumFetch(
   // Skip injection if the caller already set an auth header.
   const existing = new Headers(init?.headers);
   if (existing.has('Authorization') || existing.has('X-WorldMonitor-Key')) {
-    const res = await globalThis.fetch(input, init);
+    const res = await globalThis.fetch(input, withCredentials(init));
     reportServerError(res, input);
     return res;
   }
@@ -129,22 +177,19 @@ export async function premiumFetch(
     const wmKey = getRuntimeConfigSnapshot().secrets['WORLDMONITOR_API_KEY']?.value;
     if (wmKey) {
       existing.set('X-WorldMonitor-Key', wmKey);
-      const res = await globalThis.fetch(input, { ...init, headers: existing });
+      const res = await globalThis.fetch(input, { ...withCredentials(init), headers: existing });
       reportServerError(res, input);
       return res;
     }
   } catch { /* not available — fall through */ }
 
-  // 2. Tester / widget keys from localStorage.
-  // Must run BEFORE Clerk to prevent a free Clerk session from intercepting the
-  // request and returning 403 before the tester key is ever checked.
-  // Try wm-pro-key first, then wm-widget-key. A relay-only pro key can be invalid
-  // for the gateway even when the widget key is valid for premium RPC access.
+  // 2. Legacy in-memory test seam. In production, tester/widget keys are
+  // HttpOnly cookies and ride along through credentials: 'include'.
   const testerKeys = await loadTesterKeys();
   for (const testerKey of testerKeys) {
     const testerHeaders = new Headers(existing);
     testerHeaders.set('X-WorldMonitor-Key', testerKey);
-    const res = await globalThis.fetch(input, { ...init, headers: testerHeaders });
+    const res = await globalThis.fetch(input, { ...withCredentials(init), headers: testerHeaders });
     if (res.status !== 401) {
       reportServerError(res, input);
       return res;
@@ -159,16 +204,23 @@ export async function premiumFetch(
   //    the interceptor attach wms_ and the gateway accept it.
   if (isPremiumRpcTarget(input)) {
     try {
-      let token: string | null = null;
-      if (_testProviders?.getClerkToken) {
-        token = await _testProviders.getClerkToken();
-      } else {
-        const { getClerkToken } = await import('@/services/clerk');
-        token = await getClerkToken();
+      let token = await resolveClerkToken();
+      // Boot-window auth race: while Clerk/Convex bootstrap the session,
+      // clearClerkTokenCache() bumps the token generation (so a rotating
+      // user's stale JWT is never painted), which makes any in-flight
+      // getClerkToken() abandon to null. A signed-in user's premium fetch
+      // that lands in that window would otherwise fall through to an
+      // unauthenticated request and 401 (the FINANCIAL panel firing
+      // analyze-stock per symbol on first paint is the canonical trigger).
+      // Retry the token exactly once after the rotation settles, gated on a
+      // present Clerk user so anonymous visitors fall through immediately.
+      if (!token && await isClerkUserSignedIn()) {
+        await delayBeforeClerkRetry();
+        token = await resolveClerkToken();
       }
       if (token) {
         existing.set('Authorization', `Bearer ${token}`);
-        const res = await globalThis.fetch(input, { ...init, headers: existing });
+        const res = await globalThis.fetch(input, { ...withCredentials(init), headers: existing });
         reportServerError(res, input);
         return res;
       }
@@ -180,7 +232,7 @@ export async function premiumFetch(
   // attaches wms_) → gateway accepts → 200. For premium paths reached here
   // (no API key, no tester key, no Clerk Bearer) the gateway will return
   // 401, which is correct.
-  const res = await globalThis.fetch(input, init);
+  const res = await globalThis.fetch(input, withCredentials(init));
   reportServerError(res, input);
   return res;
 }

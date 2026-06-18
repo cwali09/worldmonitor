@@ -90,7 +90,7 @@ function makeOptionsRequest(origin = 'https://worldmonitor.app') {
 
 // Minimal MCP server stub — returns valid JSON-RPC responses
 function makeMcpFetch({ initStatus = 200, listStatus = 200, callStatus = 200, tools = [], callResult = { content: [] } } = {}) {
-  return async (url, opts) => {
+  return async (_url, opts) => {
     const body = opts?.body ? JSON.parse(opts.body) : {};
     if (body.method === 'initialize' || body.method === 'notifications/initialized') {
       return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 'test', version: '1' } } }), {
@@ -509,6 +509,34 @@ describe('api/mcp-proxy', () => {
   // ── SSE SSRF protection ───────────────────────────────────────────────────
 
   describe('SSE endpoint SSRF protection', () => {
+    async function expectRejectedEndpoint(endpointData, serverUrl = 'https://mcp.example.com/sse') {
+      let postCount = 0;
+      globalThis.fetch = async (_url, opts) => {
+        // First call = SSE connect
+        if (!opts?.body) {
+          const encoder = new TextEncoder();
+          const stream = new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoder.encode(`event: endpoint\ndata: ${endpointData}\n\n`));
+              controller.close();
+            },
+          });
+          return new Response(stream, {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' },
+          });
+        }
+        postCount += 1;
+        return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      };
+
+      const res = await handler(makeGetRequest({ serverUrl }));
+      assert.equal(res.status, 422);
+      const data = await res.json();
+      assert.match(data.error, /blocked|endpoint|origin|protocol|host/i);
+      assert.equal(postCount, 0, 'rejected endpoint must not receive JSON-RPC POSTs');
+    }
+
     it('rejects SSE endpoint event that redirects to private IP', async () => {
       globalThis.fetch = async (url, opts) => {
         const u = typeof url === 'string' ? url : url.toString();
@@ -534,6 +562,21 @@ describe('api/mcp-proxy', () => {
       const data = await res.json();
       assert.match(data.error, /blocked|SSRF|endpoint/i);
     });
+
+    it('rejects SSE endpoint event that redirects to a different public hostname', async () => {
+      await expectRejectedEndpoint('https://internal-service.corp/message');
+    });
+
+    it('rejects SSE endpoint event that changes the origin port', async () => {
+      await expectRejectedEndpoint(
+        'https://mcp.example.com:6379/message',
+        'https://mcp.example.com:443/sse',
+      );
+    });
+
+    it('rejects SSE endpoint event that downgrades HTTPS to HTTP on the same host', async () => {
+      await expectRejectedEndpoint('http://mcp.example.com/message');
+    });
   });
 
   // ── SSE response parsing ──────────────────────────────────────────────────
@@ -541,7 +584,7 @@ describe('api/mcp-proxy', () => {
   describe('SSE content-type response parsing', () => {
     it('parses JSON-RPC result from SSE response body', async () => {
       const sseTools = [{ name: 'web_search', description: 'Search', inputSchema: {} }];
-      globalThis.fetch = async (url, opts) => {
+      globalThis.fetch = async (_url, opts) => {
         const body = opts?.body ? JSON.parse(opts.body) : {};
         if (body.method === 'initialize') {
           const sseData = `data: ${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-03-26', capabilities: {} } })}\n\n`;

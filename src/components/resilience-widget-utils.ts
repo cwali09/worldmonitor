@@ -40,13 +40,24 @@ const RESILIENCE_NOT_APPLICABLE_WHEN_ZERO_COVERAGE_IDS: ReadonlySet<string> = ne
   'sovereignFiscalBuffer',
 ]);
 
+// Mirrors server/worldmonitor/resilience/v1/_shared.ts. Keep this table
+// in sync so the widget Coverage % matches API overallCoverage semantics;
+// tests/resilience-staleness-factor-parity.test.mts guards drift.
+const STALENESS_CONFIDENCE_COVERAGE_FACTOR: Readonly<Record<string, number>> = {
+  '': 1.0,
+  fresh: 1.0,
+  aging: 0.7,
+  stale: 0.4,
+};
+
 // Gated locked-preview fixture rendered when the resilience widget is
 // visible to non-entitled users. The preview is blurred and
 // non-interactive via the .resilience-widget__preview CSS class, so
 // the exact values do not need to match any real country. They just
-// need to populate the 6 domain bars AND the 19-cell per-dimension
-// confidence grid (T1.6) with realistic-looking data so the gated
-// card is not a blank gap. Raised in PR #2949 review. Lives in this
+// need to populate the 6 domain bars AND the 22-cell serialized
+// per-dimension confidence grid (20 active + 2 retired) with
+// realistic-looking data so the gated card is not a blank gap. Raised
+// in PR #2949 review. Lives in this
 // dependency-free utils module so tests can import it without
 // pulling in the full ResilienceWidget class (the class indirectly
 // depends on `import.meta.env.DEV` via proxy.ts, which breaks plain
@@ -76,6 +87,7 @@ export const LOCKED_PREVIEW: ResilienceScoreResponse = {
         { id: 'macroFiscal', score: 85, coverage: 0.95, observedWeight: 0.95, imputedWeight: 0.05, imputationClass: '', freshness: { lastObservedAtMs: LOCKED_PREVIEW_FRESH_AT_MS, staleness: 'fresh' } },
         { id: 'currencyExternal', score: 80, coverage: 0.88, observedWeight: 0.88, imputedWeight: 0.12, imputationClass: '', freshness: { lastObservedAtMs: LOCKED_PREVIEW_FRESH_AT_MS, staleness: 'fresh' } },
         { id: 'tradePolicy', score: 78, coverage: 0.9, observedWeight: 0.9, imputedWeight: 0.1, imputationClass: '', freshness: { lastObservedAtMs: LOCKED_PREVIEW_FRESH_AT_MS, staleness: 'fresh' } },
+        { id: 'financialSystemExposure', score: 74, coverage: 0.72, observedWeight: 0.72, imputedWeight: 0.28, imputationClass: 'unmonitored', freshness: { lastObservedAtMs: LOCKED_PREVIEW_AGING_AT_MS, staleness: 'aging' } },
       ],
     },
     {
@@ -122,11 +134,13 @@ export const LOCKED_PREVIEW: ResilienceScoreResponse = {
       weight: 1.0,
       dimensions: [
         { id: 'fiscalSpace', score: 72, coverage: 0.9, observedWeight: 0.9, imputedWeight: 0.1, imputationClass: '', freshness: { lastObservedAtMs: LOCKED_PREVIEW_FRESH_AT_MS, staleness: 'fresh' } },
-        { id: 'reserveAdequacy', score: 55, coverage: 0.85, observedWeight: 0.85, imputedWeight: 0.15, imputationClass: '', freshness: { lastObservedAtMs: LOCKED_PREVIEW_FRESH_AT_MS, staleness: 'fresh' } },
+        { id: 'reserveAdequacy', score: 50, coverage: 0, observedWeight: 0, imputedWeight: 0, imputationClass: '', freshness: { lastObservedAtMs: '0', staleness: '' } },
         { id: 'externalDebtCoverage', score: 60, coverage: 0.8, observedWeight: 0.8, imputedWeight: 0.2, imputationClass: '', freshness: { lastObservedAtMs: LOCKED_PREVIEW_FRESH_AT_MS, staleness: 'fresh' } },
         { id: 'importConcentration', score: 70, coverage: 0.75, observedWeight: 0.75, imputedWeight: 0.25, imputationClass: 'unmonitored', freshness: { lastObservedAtMs: LOCKED_PREVIEW_AGING_AT_MS, staleness: 'aging' } },
         { id: 'stateContinuity', score: 80, coverage: 0.92, observedWeight: 0.92, imputedWeight: 0.08, imputationClass: '', freshness: { lastObservedAtMs: LOCKED_PREVIEW_FRESH_AT_MS, staleness: 'fresh' } },
-        { id: 'fuelStockDays', score: 50, coverage: 0.3, observedWeight: 0, imputedWeight: 1, imputationClass: 'unmonitored', freshness: { lastObservedAtMs: LOCKED_PREVIEW_STALE_AT_MS, staleness: 'stale' } },
+        { id: 'fuelStockDays', score: 50, coverage: 0, observedWeight: 0, imputedWeight: 0, imputationClass: '', freshness: { lastObservedAtMs: '0', staleness: '' } },
+        { id: 'liquidReserveAdequacy', score: 67, coverage: 0.82, observedWeight: 0.82, imputedWeight: 0.18, imputationClass: '', freshness: { lastObservedAtMs: LOCKED_PREVIEW_FRESH_AT_MS, staleness: 'fresh' } },
+        { id: 'sovereignFiscalBuffer', score: 54, coverage: 0.65, observedWeight: 0.65, imputedWeight: 0.35, imputationClass: 'unmonitored', freshness: { lastObservedAtMs: LOCKED_PREVIEW_AGING_AT_MS, staleness: 'aging' } },
       ],
     },
   ],
@@ -161,6 +175,12 @@ export const RESILIENCE_VISUAL_LEVEL_COLORS: Record<ResilienceVisualLevel, strin
   unknown: 'var(--text-faint)',
 };
 
+export const RESILIENCE_PILLAR_IDS = [
+  'structural-readiness',
+  'live-shock-exposure',
+  'recovery-capacity',
+] as const;
+
 const DOMAIN_LABELS: Record<string, string> = {
   economic: 'Economic',
   infrastructure: 'Infra & Supply',
@@ -171,12 +191,108 @@ const DOMAIN_LABELS: Record<string, string> = {
 };
 
 export function getResilienceVisualLevel(score: number): ResilienceVisualLevel {
-  if (!Number.isFinite(score)) return 'unknown';
+  if (!Number.isFinite(score) || score < 0) return 'unknown';
   if (score >= 80) return 'very_high';
   if (score >= 60) return 'high';
   if (score >= 40) return 'moderate';
   if (score >= 20) return 'low';
   return 'very_low';
+}
+
+export function formatResilienceVisualLevel(level: ResilienceVisualLevel): string {
+  if (level === 'unknown') return 'Insufficient data';
+  return level.replace(/_/g, ' ');
+}
+
+export function formatResilienceServerLevel(level: string | null | undefined): string {
+  const normalized = String(level || '').trim().toLowerCase();
+  return normalized.length > 0 ? normalized.replace(/_/g, ' ') : 'unknown';
+}
+
+function hasAuthoritativeResilienceServerLevel(level: string | null | undefined): boolean {
+  const normalized = String(level || '').trim().toLowerCase();
+  return normalized.length > 0 && normalized !== 'unknown';
+}
+
+export function hasScoredResilienceOverall(
+  data: Pick<ResilienceScoreResponse, 'overallScore' | 'level'> | null | undefined,
+): boolean {
+  if (!data || typeof data.overallScore !== 'number' || !Number.isFinite(data.overallScore) || data.overallScore < 0) {
+    return false;
+  }
+  // Zero is a valid explicit score only when the API also supplies a real level.
+  return data.overallScore !== 0 || hasAuthoritativeResilienceServerLevel(data.level);
+}
+
+export function formatScoredResilienceOverallLabel(score: number): string {
+  const clampedScore = Math.min(100, Math.max(0, score));
+  const roundedScore = Math.round(clampedScore);
+  if (clampedScore > 0 && roundedScore === 0) return '<1';
+  return String(roundedScore);
+}
+
+export interface ResilienceOverallDisplay {
+  hasScore: boolean;
+  scoreForBar: number;
+  scoreLabel: string;
+  visualLevel: ResilienceVisualLevel;
+  visualLevelLabel: string;
+  serverLevelLabel: string;
+}
+
+export function getResilienceOverallDisplay(data: Pick<ResilienceScoreResponse, 'overallScore' | 'level'>): ResilienceOverallDisplay {
+  const rawScore = Number(data.overallScore);
+  const visualLevel = getResilienceVisualLevel(rawScore);
+  if (!hasScoredResilienceOverall(data)) {
+    return {
+      hasScore: false,
+      scoreForBar: 0,
+      scoreLabel: 'n/a',
+      visualLevel: 'unknown',
+      visualLevelLabel: 'Insufficient data',
+      serverLevelLabel: `API level: ${formatResilienceServerLevel(data.level)}`,
+    };
+  }
+
+  const clampedScore = Math.min(100, Math.max(0, rawScore));
+  return {
+    hasScore: true,
+    scoreForBar: clampedScore,
+    scoreLabel: formatScoredResilienceOverallLabel(clampedScore),
+    visualLevel,
+    visualLevelLabel: `Visual band: ${formatResilienceVisualLevel(visualLevel).toUpperCase()}`,
+    serverLevelLabel: `API level: ${formatResilienceServerLevel(data.level)}`,
+  };
+}
+
+export function shouldRenderResilienceBaselineStress(
+  data: Pick<ResilienceScoreResponse, 'overallScore' | 'level' | 'baselineScore' | 'stressScore'>,
+  overallDisplay: Pick<ResilienceOverallDisplay, 'hasScore'> = getResilienceOverallDisplay(data),
+): boolean {
+  return overallDisplay.hasScore && data.baselineScore != null && data.stressScore != null;
+}
+
+export interface ResilienceMethodologySummary {
+  activeDimensionCount: number;
+  // Kept for server/fixture parity tests; tooltip copy intentionally shows active dimensions only.
+  serializedDimensionCount: number;
+  domainCount: number;
+  pillarCount: number;
+}
+
+export function getResilienceMethodologySummary(data: ResilienceScoreResponse = LOCKED_PREVIEW): ResilienceMethodologySummary {
+  const dimensions = data.domains.flatMap((domain) => domain.dimensions);
+  return {
+    activeDimensionCount: dimensions.filter((dimension) => !RESILIENCE_RETIRED_DIMENSION_IDS.has(dimension.id)).length,
+    serializedDimensionCount: dimensions.length,
+    domainCount: data.domains.length,
+    pillarCount: data.pillars.length > 0 ? data.pillars.length : RESILIENCE_PILLAR_IDS.length,
+  };
+}
+
+export function formatResilienceMethodologyHelpTitle(summary = getResilienceMethodologySummary()): string {
+  // Keep the human-readable domain/pillar labels in sync if the methodology count parity tests change.
+  return `Composite resilience score from ${summary.activeDimensionCount} active dimensions across ${summary.domainCount} domains (economic, infrastructure, energy, social & governance, health & food, recovery). The current methodology groups scores into ${summary.pillarCount} pillars (structural readiness, live shock exposure, recovery capacity); pillar detail appears when the API response includes it. Weights sum to 1.00; recovery carries the largest single-domain weight (0.25).`;
 }
 
 export function getResilienceTrendArrow(trend: string): string {
@@ -209,10 +325,12 @@ export function formatResilienceConfidence(data: ResilienceScoreResponse): strin
   // coverage percentage. The same filter pair is applied server-side
   // by `_shared.ts:computeOverallCoverage` — keeping them in lockstep
   // ensures the widget Coverage % matches the server's
-  // `overallCoverage` field. Genuine data sparsity (non-retired,
-  // non-NA coverage=0) stays in the average because it reflects a
-  // real confidence signal; the server already sets `lowConfidence`
-  // when the overall picture is too sparse, which short-circuits above.
+  // `overallCoverage` field. Stale observed data uses the same
+  // derated confidence coverage as the server. Genuine data sparsity
+  // (non-retired, non-NA coverage=0) stays in the average because it
+  // reflects a real confidence signal; the server already sets
+  // `lowConfidence` when the overall picture is too sparse, which
+  // short-circuits above.
   const coverages = data.domains.flatMap((d) =>
     d.dimensions
       .filter((dim) => {
@@ -231,12 +349,21 @@ export function formatResilienceConfidence(data: ResilienceScoreResponse): strin
         ) return false;
         return true;
       })
-      .map((dim) => dim.coverage),
+      .map((dim) => confidenceCoverage(dim)),
   );
   const avgCoverage = coverages.length > 0
     ? Math.round((coverages.reduce((s, c) => s + c, 0) / coverages.length) * 100)
     : 0;
   return `Coverage ${avgCoverage}% ✓`;
+}
+
+function confidenceCoverage(dimension: ResilienceScoreResponse['domains'][number]['dimensions'][number]): number {
+  const lastObservedAtMs = Number(dimension.freshness?.lastObservedAtMs ?? 0);
+  if (!Number.isFinite(lastObservedAtMs) || lastObservedAtMs <= 0) {
+    return dimension.coverage;
+  }
+  const staleness = dimension.freshness?.staleness ?? '';
+  return dimension.coverage * (STALENESS_CONFIDENCE_COVERAGE_FACTOR[staleness] ?? 1.0);
 }
 
 export function formatResilienceChange30d(change30d: number): string {
@@ -249,6 +376,30 @@ export function formatBaselineStress(baseline: number, stress: number): string {
   const b = Number.isFinite(baseline) ? Math.round(baseline) : 0;
   const s = Number.isFinite(stress) ? Math.round(stress) : 0;
   return `Baseline: ${b} | Stress: ${s}`;
+}
+
+type ScoreIntervalDisplayInput = ResilienceScoreResponse['scoreInterval'] | null | undefined;
+export interface ResilienceScoreIntervalDisplay {
+  label: string;
+  title: string;
+}
+
+function normalizeScoreInterval(interval: ScoreIntervalDisplayInput): { p05: number; p95: number } | null {
+  if (!interval) return null;
+  const p05 = Number(interval.p05);
+  const p95 = Number(interval.p95);
+  if (!Number.isFinite(p05) || !Number.isFinite(p95)) return null;
+  if (p05 < 0 || p05 > 100 || p95 < 0 || p95 > 100 || p05 > p95) return null;
+  return { p05, p95 };
+}
+
+export function formatResilienceScoreInterval(interval: ScoreIntervalDisplayInput): ResilienceScoreIntervalDisplay | null {
+  const normalized = normalizeScoreInterval(interval);
+  if (!normalized) return null;
+  return {
+    label: `[${Math.round(normalized.p05)}\u2013${Math.round(normalized.p95)}]`,
+    title: `95% score sensitivity band: ${normalized.p05} - ${normalized.p95}`,
+  };
 }
 
 // Formats the dataVersion field (ISO date YYYY-MM-DD, sourced from the
@@ -285,7 +436,7 @@ export function formatResilienceDataVersion(dataVersion: string | null | undefin
 // `freshness`) already on every response, so no proto or schema
 // changes are needed to render the full grid.
 
-// Short labels for each of the 19 dimensions so the compact grid does
+// Short labels for each serialized dimension so the compact grid does
 // not wrap. Keys match `ResilienceDimensionId` from
 // server/worldmonitor/resilience/v1/_dimension-scorers.ts. The doc
 // linter test (resilience-methodology-lint.test.mts) already pins the
@@ -315,8 +466,8 @@ const DIMENSION_LABELS: Record<string, string> = {
   stateContinuity: 'Continuity',
   fuelStockDays: 'Fuel',
   // PR 2 §3.4 — new active dimensions. Labels chosen to stay short
-  // enough for the 19/21-cell confidence grid without leaking the
-  // internal ID. "Reserves" is already taken by the retired
+  // enough for the 20-active/22-serialized-cell confidence grid
+  // without leaking the internal ID. "Reserves" is already taken by the retired
   // reserveAdequacy so the replacement disambiguates with "Liquid".
   liquidReserveAdequacy: 'Liquid Reserves',
   sovereignFiscalBuffer: 'Sovereign Wealth',
@@ -424,6 +575,12 @@ const STALENESS_LABELS: Record<Exclude<DimensionStaleness, null>, string> = {
   stale: 'Stale (beyond 3x cadence)',
 };
 
+const STALENESS_ICONS: Record<Exclude<DimensionStaleness, null>, string> = {
+  fresh: '\u25CF',
+  aging: '\u25D0',
+  stale: '\u25CB',
+};
+
 export function getImputationClassLabel(c: DimensionImputationClass): string {
   if (!c) return 'Unknown imputation class';
   return IMPUTATION_CLASS_LABELS[c];
@@ -437,6 +594,11 @@ export function getImputationClassIcon(c: DimensionImputationClass): string {
 export function getStalenessLabel(s: DimensionStaleness): string {
   if (!s) return 'Unknown freshness';
   return STALENESS_LABELS[s];
+}
+
+export function getStalenessIcon(s: DimensionStaleness): string {
+  if (!s) return '';
+  return STALENESS_ICONS[s];
 }
 
 /**

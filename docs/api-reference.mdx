@@ -9,7 +9,7 @@ WorldMonitor exposes its data through a family of versioned REST services. Every
 https://api.worldmonitor.app/api/<service>/v1/<rpc-name>
 ```
 
-`<rpc-name>` is kebab-case (e.g. `list-acled-events`, `get-resilience-ranking`). Auth is the same on every service — pass `X-WorldMonitor-Key: wm_live_...` (or rely on a trusted browser origin). See [Authentication](/usage-auth) for details.
+`<rpc-name>` is kebab-case (e.g. `list-acled-events`, `get-resilience-ranking`). Auth is the same on every service — pass a user API key such as `X-WorldMonitor-Key: wm_0123456789abcdef0123456789abcdef01234567`, an operator-issued enterprise key, or use the dashboard's browser session where supported. See [Authentication](/usage-auth) for details.
 
 The grouped pages in the left sidebar render the full OpenAPI spec — request parameters, response schemas, and try-it-out — for each service.
 
@@ -17,7 +17,7 @@ The grouped pages in the left sidebar render the full OpenAPI spec — request p
 
 Building an agent or codegen pipeline? Point at `https://worldmonitor.app/` and follow the `Link:` header — every OpenAPI spec, MCP server card, OAuth endpoint, and agent-skill bundle is discoverable from one root URL via standard `.well-known` paths. See [Agent Discovery](/agent-discovery) for the full walkthrough.
 
-The single bundled spec is at [`/openapi.yaml`](https://www.worldmonitor.app/openapi.yaml) — feed it to any OpenAPI generator to produce typed clients for all 30+ services in one pass.
+The single bundled spec is at [`/openapi.yaml`](https://www.worldmonitor.app/openapi.yaml) — feed it to any OpenAPI generator to produce typed clients for all 34 services in one pass.
 
 ## Service catalog
 

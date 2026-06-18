@@ -2,7 +2,7 @@ import { Panel } from './Panel';
 import { t } from '@/services/i18n';
 import type { MarketData, CryptoData, TokenData } from '@/types';
 import { formatPrice, formatChange, getChangeClass, getHeatmapClass } from '@/utils';
-import { escapeHtml } from '@/utils/sanitize';
+import { escapeHtml, unsafeRawHtml } from '@/utils/sanitize';
 import { miniSparkline } from '@/utils/sparkline';
 import { SITE_VARIANT } from '@/config';
 import { createWatchlistButton } from './watchlist-modal';
@@ -37,7 +37,7 @@ export class MarketPanel extends Panel {
       )
       .join('');
 
-    this.setContent(html);
+    this.setSafeContent(unsafeRawHtml(html, 'legacy Panel.setContent() migration'));
   }
 }
 
@@ -112,11 +112,11 @@ export class HeatmapPanel extends Panel {
     const tabBar = this._buildTabBar();
 
     if (this._tab === 'valuations' && Object.keys(this._valuations).length > 0) {
-      this.setContent(tabBar + this._renderValuations());
+      this.setSafeContent(unsafeRawHtml(tabBar + this._renderValuations(), 'legacy Panel.setContent() migration'));
       return;
     }
 
-    this.setContent(tabBar + this._renderPerformance());
+    this.setSafeContent(unsafeRawHtml(tabBar + this._renderPerformance(), 'legacy Panel.setContent() migration'));
   }
 
   private _renderPerformance(): string {
@@ -466,25 +466,29 @@ export class CommoditiesPanel extends Panel {
           ${changeStr ? `<div class="commodity-change ${escapeHtml(changeClass)}">${escapeHtml(changeStr)}</div>` : ''}
         </div>`;
       }).join('');
-      this.setContent(tabBar + `<div class="commodities-grid">${items}</div><div style="margin-top:6px;font-size:9px;color:var(--text-dim)">Source: ECB</div>`);
+      this.setSafeContent(unsafeRawHtml(tabBar + `<div class="commodities-grid">${items}</div><div style="margin-top:6px;font-size:9px;color:var(--text-dim)">Source: ECB</div>`, 'legacy Panel.setContent() migration'));
       return;
     }
 
     if (this._tab === 'xau' && hasXau) {
-      this.setContent(tabBar + this._renderXau());
+      this.setSafeContent(unsafeRawHtml(tabBar + this._renderXau(), 'legacy Panel.setContent() migration'));
       return;
     }
 
-    // Metals/Commodities tab — exclude FX and spot gold symbols from the display grid
+    // Metals/Commodities tab — exclude FX and spot gold symbols from the display grid.
+    // Require a finite numeric price: the feed sometimes omits `price` (undefined),
+    // and `d.price !== null` lets undefined through to `formatPrice(c.price!)`
+    // (WORLDMONITOR-SH). A finite-price guard also keeps the adjacent `c.change!`
+    // row meaningful (a record with no price carries no usable change either).
     const validData = this._commodityData.filter(
-      (d) => d.price !== null && !d.symbol?.endsWith('=X'),
+      (d) => typeof d.price === 'number' && Number.isFinite(d.price) && !d.symbol?.endsWith('=X'),
     );
     if (validData.length === 0) {
       if (!hasFx) {
         this.showRetrying(t('common.failedCommodities'));
         return;
       }
-      this.setContent(tabBar + `<div style="padding:8px;color:var(--text-dim);font-size:12px">${t('common.failedCommodities')}</div>`);
+      this.setSafeContent(unsafeRawHtml(tabBar + `<div style="padding:8px;color:var(--text-dim);font-size:12px">${t('common.failedCommodities')}</div>`, 'legacy Panel.setContent() migration'));
       return;
     }
 
@@ -498,7 +502,7 @@ export class CommoditiesPanel extends Panel {
         </div>
       `).join('') + '</div>';
 
-    this.setContent(tabBar + grid);
+    this.setSafeContent(unsafeRawHtml(tabBar + grid, 'legacy Panel.setContent() migration'));
   }
 }
 
@@ -531,7 +535,7 @@ export class CryptoPanel extends Panel {
       )
       .join('');
 
-    this.setContent(html);
+    this.setSafeContent(unsafeRawHtml(html, 'legacy Panel.setContent() migration'));
   }
 }
 
@@ -561,7 +565,7 @@ export class CryptoHeatmapPanel extends Panel {
         .join('') +
       '</div>';
 
-    this.setContent(html);
+    this.setSafeContent(unsafeRawHtml(html, 'legacy Panel.setContent() migration'));
   }
 }
 
@@ -590,7 +594,7 @@ export class TokenListPanel extends Panel {
       )
       .join('');
 
-    this.setContent(rows);
+    this.setSafeContent(unsafeRawHtml(rows, 'legacy Panel.setContent() migration'));
   }
 }
 

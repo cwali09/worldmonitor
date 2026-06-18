@@ -1,6 +1,6 @@
 import '@/styles/settings-window.css';
 import { CANONICAL_FEEDS, INTEL_SOURCES, SOURCE_REGION_MAP } from '@/config/feeds';
-import { PANEL_CATEGORY_MAP, ALL_PANELS, VARIANT_DEFAULTS, getEffectivePanelConfig, isPanelEntitled, FREE_MAX_PANELS } from '@/config/panels';
+import { PANEL_CATEGORY_MAP, ALL_PANELS, VARIANT_DEFAULTS, getEffectivePanelConfig, getVariantPanelCategories, isPanelEntitled, FREE_MAX_PANELS } from '@/config/panels';
 import { isProUser } from '@/services/widget-store';
 import { SITE_VARIANT } from '@/config/variant';
 import { t } from '@/services/i18n';
@@ -16,6 +16,8 @@ import { hasPremiumAccess } from '@/services/panel-gating';
 import { getSubscription, openBillingPortal, prereserveBillingPortalTab } from '@/services/billing';
 import { createApiKey, listApiKeys, revokeApiKey, type ApiKeyInfo } from '@/services/api-keys';
 import { listMcpClients, revokeMcpClient, fetchMcpQuota, type McpClientInfo, type McpQuota } from '@/services/mcp-clients';
+import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+
 
 function showToast(msg: string): void {
   document.querySelector('.toast-notification')?.remove();
@@ -293,7 +295,7 @@ export class UnifiedSettings {
       this.entitlementReady = true;
       const panel = this.overlay.querySelector<HTMLElement>('[data-panel-id="api-keys"]');
       if (panel) {
-        panel.innerHTML = this.renderApiKeysContent();
+        setTrustedHtml(panel, trustedHtml(this.renderApiKeysContent(), "legacy direct innerHTML migration"));
         // Re-attach CTA and input handlers for the refreshed content
         this.attachApiKeysHandlers();
         if (this.activeTab === 'api-keys' && getAuthState().user && hasFeature('apiAccess')) {
@@ -329,7 +331,7 @@ export class UnifiedSettings {
     const upgradeSection = this.overlay.querySelector('.upgrade-pro-section');
     if (!upgradeSection) return;
     const fresh = document.createElement('template');
-    fresh.innerHTML = this.renderUpgradeSection().trim();
+    setTrustedHtml(fresh, trustedHtml(this.renderUpgradeSection().trim(), "legacy direct innerHTML migration"));
     const next = fresh.content.firstElementChild;
     if (next) upgradeSection.replaceWith(next);
   }
@@ -364,7 +366,7 @@ export class UnifiedSettings {
     btn.className = 'unified-settings-btn';
     btn.id = 'unifiedSettingsBtn';
     btn.setAttribute('aria-label', t('header.settings'));
-    btn.innerHTML = GEAR_SVG;
+    setTrustedHtml(btn, trustedHtml(GEAR_SVG, "legacy direct innerHTML migration"));
     btn.addEventListener('click', () => this.open());
     return btn;
   }
@@ -411,7 +413,7 @@ export class UnifiedSettings {
       ? renderNotificationsSettings({ isSignedIn })
       : null;
 
-    this.overlay.innerHTML = `
+    setTrustedHtml(this.overlay, trustedHtml(`
       <div class="modal unified-settings-modal">
         <div class="modal-header">
           <span class="modal-title">${t('header.settings')}</span>
@@ -471,7 +473,7 @@ export class UnifiedSettings {
         </div>
         ` : ''}
       </div>
-    `;
+    `, "legacy direct innerHTML migration"));
 
     const settingsPanel = this.overlay.querySelector('#us-tab-panel-settings');
     if (settingsPanel) {
@@ -675,20 +677,11 @@ export class UnifiedSettings {
   }
 
   private getAvailablePanelCategories(): Array<{ key: string; label: string }> {
-    const settings = this.config.getPanelSettings();
-    const categories: Array<{ key: string; label: string }> = [
-      { key: 'all', label: t('header.sourceRegionAll') }
+    return [
+      { key: 'all', label: t('header.sourceRegionAll') },
+      ...getVariantPanelCategories(this.config.getPanelSettings(), SITE_VARIANT)
+        .map(({ key, labelKey }) => ({ key, label: t(labelKey) })),
     ];
-
-    for (const [catKey, catDef] of Object.entries(PANEL_CATEGORY_MAP)) {
-      if (!this.categoryMatchesVariant(catDef)) continue;
-      const hasEnabledPanel = catDef.panelKeys.some(pk => settings[pk]?.enabled);
-      if (hasEnabledPanel) {
-        categories.push({ key: catKey, label: t(catDef.labelKey) });
-      }
-    }
-
-    return categories;
   }
 
   private getVisiblePanelEntries(): Array<[string, PanelConfig]> {
@@ -725,9 +718,9 @@ export class UnifiedSettings {
     if (!bar) return;
 
     const categories = this.getAvailablePanelCategories();
-    bar.innerHTML = categories.map(c =>
+    setTrustedHtml(bar, trustedHtml(categories.map(c =>
       `<button class="unified-settings-region-pill${this.activePanelCategory === c.key ? ' active' : ''}" data-panel-cat="${c.key}">${escapeHtml(c.label)}</button>`
-    ).join('');
+    ).join(''), "legacy direct innerHTML migration"));
   }
 
   private renderPanelsTab(): void {
@@ -737,19 +730,22 @@ export class UnifiedSettings {
     const savedSettings = this.config.getPanelSettings();
     const pro = isProUser();
     const entries = this.getVisiblePanelEntries();
-    container.innerHTML = entries.map(([key, panel]) => {
-      const entitled = isPanelEntitled(key, ALL_PANELS[key] ?? panel, pro);
+    setTrustedHtml(container, trustedHtml(entries.map(([key, panel]) => {
+      // Preserve saved config for dynamic cw-* panels; unknown keys should not
+      // collapse to getEffectivePanelConfig's disabled synthetic fallback.
+      const resolvedPanel = ALL_PANELS[key] ? getEffectivePanelConfig(key, SITE_VARIANT) : panel;
+      const entitled = isPanelEntitled(key, resolvedPanel, pro);
       const locked = !entitled;
       const changed = !locked && savedSettings[key]?.enabled !== panel.enabled;
-      const displayName = this.config.getLocalizedPanelName(key, getEffectivePanelConfig(key, SITE_VARIANT).name ?? panel.name);
+      const displayName = this.config.getLocalizedPanelName(key, resolvedPanel.name ?? panel.name);
       return `
         <div class="panel-toggle-item ${panel.enabled && !locked ? 'active' : ''}${changed ? ' changed' : ''}${locked ? ' pro-locked' : ''}" data-panel="${escapeHtml(key)}" aria-pressed="${panel.enabled && !locked}" ${locked ? 'data-pro-locked="1"' : ''}>
           <div class="panel-toggle-checkbox">${panel.enabled && !locked ? '\u2713' : ''}${locked ? '\uD83D\uDD12' : ''}</div>
           <span class="panel-toggle-label">${escapeHtml(displayName)}</span>
-          ${(locked || (ALL_PANELS[key] ?? panel).premium) ? '<span class="panel-toggle-pro-badge">PRO</span>' : ''}
+          ${(locked || resolvedPanel.premium) ? '<span class="panel-toggle-pro-badge">PRO</span>' : ''}
         </div>
       `;
-    }).join('');
+    }).join(''), "legacy direct innerHTML migration"));
 
     this.updatePanelsFooter();
   }
@@ -780,7 +776,10 @@ export class UnifiedSettings {
   private toggleDraftPanel(key: string): void {
     const panel = this.draftPanelSettings[key];
     if (!panel) return;
-    if (!panel.enabled && !isPanelEntitled(key, ALL_PANELS[key] ?? panel, isProUser())) return;
+    // Preserve saved config for dynamic cw-* panels; unknown keys should not
+    // collapse to getEffectivePanelConfig's disabled synthetic fallback.
+    const resolvedPanel = ALL_PANELS[key] ? getEffectivePanelConfig(key, SITE_VARIANT) : panel;
+    if (!panel.enabled && !isPanelEntitled(key, resolvedPanel, isProUser())) return;
     if (!panel.enabled && !isProUser()) {
       const enabledCount = Object.entries(this.draftPanelSettings).filter(([k, p]) => p.enabled && !k.startsWith('cw-')).length;
       if (enabledCount >= FREE_MAX_PANELS) {
@@ -898,9 +897,9 @@ export class UnifiedSettings {
     if (!bar) return;
 
     const regions = this.getAvailableRegions();
-    bar.innerHTML = regions.map(r =>
+    setTrustedHtml(bar, trustedHtml(regions.map(r =>
       `<button class="unified-settings-region-pill${this.activeSourceRegion === r.key ? ' active' : ''}" data-region="${r.key}">${escapeHtml(r.label)}</button>`
-    ).join('');
+    ).join(''), "legacy direct innerHTML migration"));
   }
 
   private renderSourcesGrid(): void {
@@ -910,7 +909,7 @@ export class UnifiedSettings {
     const sources = this.getVisibleSourceNames();
     const disabled = this.config.getDisabledSources();
 
-    container.innerHTML = sources.map(source => {
+    setTrustedHtml(container, trustedHtml(sources.map(source => {
       const isEnabled = !disabled.has(source);
       const escaped = escapeHtml(source);
       return `
@@ -919,7 +918,7 @@ export class UnifiedSettings {
           <span class="source-toggle-label">${escaped}</span>
         </div>
       `;
-    }).join('');
+    }).join(''), "legacy direct innerHTML migration"));
   }
 
   private updateSourcesCounter(): void {
@@ -1069,20 +1068,20 @@ export class UnifiedSettings {
     if (!banner) return;
 
     banner.style.display = 'block';
-    banner.innerHTML = `
+    setTrustedHtml(banner, trustedHtml(`
       <div class="api-keys-banner-title">Key created — copy it now, it won't be shown again</div>
       <div class="api-keys-banner-key">
         <code class="api-keys-key-value">${escapeHtml(key)}</code>
         <button class="btn btn-secondary api-keys-copy-btn">Copy</button>
       </div>
-    `;
+    `, "legacy direct innerHTML migration"));
   }
 
   private hideBanner(): void {
     const banner = this.overlay.querySelector<HTMLElement>('#usApiKeysBanner');
     if (banner) {
       banner.style.display = 'none';
-      banner.innerHTML = '';
+      setTrustedHtml(banner, trustedHtml('', "legacy direct innerHTML migration"));
     }
   }
 
@@ -1103,7 +1102,7 @@ export class UnifiedSettings {
     if (!container) return;
 
     if (this.apiKeysLoading && this.apiKeys.length === 0) {
-      container.innerHTML = '<div class="api-keys-loading">Loading...</div>';
+      setTrustedHtml(container, trustedHtml('<div class="api-keys-loading">Loading...</div>', "legacy direct innerHTML migration"));
       return;
     }
 
@@ -1113,7 +1112,7 @@ export class UnifiedSettings {
     const revoked = this.apiKeys.filter(k => k.revokedAt);
 
     if (active.length === 0 && revoked.length === 0) {
-      container.innerHTML = '<div class="api-keys-empty">No API keys yet. Create one above to get started.</div>';
+      setTrustedHtml(container, trustedHtml('<div class="api-keys-empty">No API keys yet. Create one above to get started.</div>', "legacy direct innerHTML migration"));
       return;
     }
 
@@ -1137,8 +1136,8 @@ export class UnifiedSettings {
       `;
     };
 
-    container.innerHTML = active.map(renderKey).join('')
-      + (revoked.length > 0 ? `<div class="api-keys-revoked-section"><div class="api-keys-revoked-label">Revoked</div>${revoked.map(renderKey).join('')}</div>` : '');
+    setTrustedHtml(container, trustedHtml(active.map(renderKey).join('')
+      + (revoked.length > 0 ? `<div class="api-keys-revoked-section"><div class="api-keys-revoked-label">Revoked</div>${revoked.map(renderKey).join('')}</div>` : ''), "legacy direct innerHTML migration"));
   }
 
   // ---------------------------------------------------------------------------
@@ -1243,7 +1242,7 @@ export class UnifiedSettings {
 
   private renderMcpQuotaInPlace(): void {
     const el = this.overlay.querySelector<HTMLElement>('#usMcpQuota');
-    if (el) el.innerHTML = this.renderMcpQuotaText();
+    if (el) setTrustedHtml(el, trustedHtml(this.renderMcpQuotaText(), "legacy direct innerHTML migration"));
   }
 
   /**
@@ -1301,7 +1300,7 @@ export class UnifiedSettings {
     if (!container) return;
 
     if (this.mcpClientsLoading && this.mcpClients.length === 0) {
-      container.innerHTML = '<div class="mcp-clients-loading">Loading...</div>';
+      setTrustedHtml(container, trustedHtml('<div class="mcp-clients-loading">Loading...</div>', "legacy direct innerHTML migration"));
       return;
     }
 
@@ -1312,7 +1311,7 @@ export class UnifiedSettings {
 
     if (active.length === 0 && revoked.length === 0) {
       const mcpUrl = 'https://api.worldmonitor.app/mcp';
-      container.innerHTML = `
+      setTrustedHtml(container, trustedHtml(`
         <div class="mcp-clients-empty">
           <div class="mcp-clients-empty-title">No connected MCP clients yet</div>
           <div class="mcp-clients-empty-desc">To connect Claude Desktop or another AI client, paste this URL into the client's MCP server settings and sign in with your WorldMonitor Pro account:</div>
@@ -1320,7 +1319,7 @@ export class UnifiedSettings {
             <code>${escapeHtml(mcpUrl)}</code>
             <button class="btn btn-secondary mcp-clients-copy-url-btn" data-copy-value="${escapeHtml(mcpUrl)}">Copy URL</button>
           </div>
-        </div>`;
+        </div>`, "legacy direct innerHTML migration"));
       return;
     }
 
@@ -1355,7 +1354,7 @@ export class UnifiedSettings {
       `;
     };
 
-    container.innerHTML = active.map(renderClient).join('')
-      + (revoked.length > 0 ? `<div class="mcp-clients-revoked-section"><div class="mcp-clients-revoked-label">Revoked</div>${revoked.map(renderClient).join('')}</div>` : '');
+    setTrustedHtml(container, trustedHtml(active.map(renderClient).join('')
+      + (revoked.length > 0 ? `<div class="mcp-clients-revoked-section"><div class="mcp-clients-revoked-label">Revoked</div>${revoked.map(renderClient).join('')}</div>` : ''), "legacy direct innerHTML migration"));
   }
 }

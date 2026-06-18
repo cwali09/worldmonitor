@@ -5,7 +5,14 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const MCP_SRC = readFileSync(resolve(HERE, '../api/mcp.ts'), 'utf8');
+// Registry now lives split across two files. Concatenate them so the
+// source-text greps (cabin_class fix shape, conditional-spread anti-pattern
+// audit, DEFAULT_LIST_LIMIT cache-tool audit) operate on the same byte
+// surface they did before the split.
+const MCP_SRC = readFileSync(resolve(HERE, '../api/mcp/registry/cache-tools.ts'), 'utf8')
+  + '\n'
+  + readFileSync(resolve(HERE, '../api/mcp/registry/rpc-tools.ts'), 'utf8');
+const ENV_EXAMPLE = readFileSync(resolve(HERE, '../.env.example'), 'utf8');
 
 /**
  * MCP schema-vs-behaviour parity test.
@@ -170,6 +177,11 @@ describe('MCP schema-vs-behaviour parity (regression guard)', () => {
       }
       assert.equal(violations.length, 0,
         `Found ${violations.length} cache-tool limit-default mismatches:\n  - ${violations.join('\n  - ')}`);
+    });
+
+    it('.env.example does not advertise stale default-limit toggles', () => {
+      assert.doesNotMatch(ENV_EXAMPLE, /\bMCP_LIMIT_DEFAULT_30\b/,
+        '.env.example must not document MCP_LIMIT_DEFAULT_30; cache tools always use DEFAULT_LIST_LIMIT unless limit:0 opts out');
     });
   });
 });

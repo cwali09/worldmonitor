@@ -38,6 +38,8 @@ export interface AlertRule {
   digestHour?: number;
   digestTimezone?: string;
   aiDigestEnabled?: boolean;
+  // Optional country-scope (ISO-3166 alpha-2). Empty/absent → all countries.
+  countries?: string[];
 }
 
 export interface ChannelsData {
@@ -144,6 +146,7 @@ export async function setQuietHours(settings: {
   quietHoursEnd?: number;
   quietHoursTimezone?: string;
   quietHoursOverride?: QuietHoursOverride;
+  countries?: string[];
 }): Promise<void> {
   const res = await authFetch('/api/notification-channels', {
     method: 'POST',
@@ -158,6 +161,7 @@ export async function setDigestSettings(settings: {
   digestMode: DigestMode;
   digestHour?: number;
   digestTimezone?: string;
+  countries?: string[];
 }): Promise<void> {
   const res = await authFetch('/api/notification-channels', {
     method: 'POST',
@@ -171,7 +175,7 @@ export async function setDigestSettings(settings: {
  * Thrown when the server rejects a (digestMode, sensitivity) pair as incompatible
  * — currently the (realtime, all) combination. UI catches this specifically to
  * render the helper text inline rather than surfacing a generic error.
- * See plans/forbid-realtime-all-events.md §1f.
+ * See docs/archive/plans/forbid-realtime-all-events.md §1f.
  */
 export class IncompatibleDeliveryError extends Error {
   constructor(message: string) {
@@ -196,6 +200,7 @@ export async function setNotificationConfig(args: {
   digestMode?: DigestMode;
   digestHour?: number;
   digestTimezone?: string;
+  countries?: string[];
 }): Promise<void> {
   const res = await authFetch('/api/notification-channels', {
     method: 'POST',

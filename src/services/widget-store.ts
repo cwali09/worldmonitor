@@ -1,11 +1,15 @@
 import { loadFromStorage, saveToStorage } from '@/utils';
+import { clearPanelColSpanEntry, clearPanelSpanEntry } from '@/utils/panel-storage';
 import { sanitizeWidgetHtml } from '@/utils/widget-sanitizer';
 import { getAuthState } from '@/services/auth-state';
 import { isEntitled } from '@/services/entitlements';
+import {
+  clearLegacyKeyStorage,
+  migrateLegacyKeysToHttpOnlySession,
+  readLegacySessionKey,
+} from '@/services/browser-key-session';
 
 const STORAGE_KEY = 'wm-custom-widgets';
-const PANEL_SPANS_KEY = 'worldmonitor-panel-spans';
-const PANEL_COL_SPANS_KEY = 'worldmonitor-panel-col-spans';
 const MAX_WIDGETS = 10;
 const MAX_HISTORY = 10;
 const MAX_HTML_CHARS = 50_000;
@@ -36,8 +40,8 @@ export function loadWidgets(): CustomWidgetSpec[] {
       const proHtml = localStorage.getItem(proHtmlKey(w.id));
       if (!proHtml) {
         // HTML missing — drop widget and clean up spans
-        cleanSpanEntry(PANEL_SPANS_KEY, w.id);
-        cleanSpanEntry(PANEL_COL_SPANS_KEY, w.id);
+        clearPanelSpanEntry(w.id);
+        clearPanelColSpanEntry(w.id);
         continue;
       }
       result.push({ ...w, tier, html: proHtml });
@@ -89,62 +93,66 @@ export function deleteWidget(id: string): void {
   const updated = loadFromStorage<CustomWidgetSpec[]>(STORAGE_KEY, []).filter(w => w.id !== id);
   saveToStorage(STORAGE_KEY, updated);
   try { localStorage.removeItem(proHtmlKey(id)); } catch { /* ignore */ }
-  cleanSpanEntry(PANEL_SPANS_KEY, id);
-  cleanSpanEntry(PANEL_COL_SPANS_KEY, id);
+  clearPanelSpanEntry(id);
+  clearPanelColSpanEntry(id);
 }
 
 export function getWidget(id: string): CustomWidgetSpec | null {
   return loadWidgets().find(w => w.id === id) ?? null;
 }
 
-// ── Cross-domain key helpers ──────────────────────────────────────────────
-// Cookies with domain=.worldmonitor.app are shared across all subdomains
-// (worldmonitor.app, tech., finance., commodity., happy., etc.).
-// We read cookie first and fall back to localStorage for migration compat.
+// ── Browser tester key helpers ─────────────────────────────────────────────
+// Legacy wm-widget-key / wm-pro-key values used to live in localStorage and
+// JS-readable cookies. New writes go to /api/wm-session, which sets short-lived
+// HttpOnly cookies. We keep only a tab-local hint so current-page flows can
+// update immediately without re-exposing the raw key after reload.
 
-const COOKIE_DOMAIN = '.worldmonitor.app';
-const KEY_MAX_AGE = 365 * 24 * 60 * 60;
+let widgetSessionHint = false;
+let proSessionHint = false;
+let migrationStarted = false;
 
-function usesCookies(): boolean {
-  return location.hostname.endsWith('worldmonitor.app');
-}
-
-function getCookieValue(name: string): string {
-  try {
-    const match = document.cookie.split('; ').find((c) => c.startsWith(`${name}=`));
-    return match ? match.slice(name.length + 1) : '';
-  } catch {
-    return '';
-  }
-}
-
-function setDomainCookie(name: string, value: string): void {
-  if (!usesCookies()) return;
-  document.cookie = `${name}=${encodeURIComponent(value)}; domain=${COOKIE_DOMAIN}; path=/; max-age=${KEY_MAX_AGE}; SameSite=Lax; Secure`;
-}
-
-function getKey(name: string): string {
-  const cookieVal = getCookieValue(name);
-  if (cookieVal) return decodeURIComponent(cookieVal);
-  try { return localStorage.getItem(name) ?? ''; } catch { return ''; }
+function migrateLegacyKeyStorage(): void {
+  if (migrationStarted || typeof window === 'undefined') return;
+  migrationStarted = true;
+  const widgetKey = readLegacySessionKey('wm-widget-key');
+  const proKey = readLegacySessionKey('wm-pro-key');
+  if (!widgetKey && !proKey) return;
+  widgetSessionHint = !!widgetKey;
+  proSessionHint = !!proKey;
+  void migrateLegacyKeysToHttpOnlySession({ widgetKey, proKey })
+    .catch(() => { /* retry on next boot; keep legacy storage until success */ });
 }
 
 export function setWidgetKey(key: string): void {
-  setDomainCookie('wm-widget-key', key);
-  try { localStorage.setItem('wm-widget-key', key); } catch { /* ignore */ }
+  const trimmed = key.trim();
+  widgetSessionHint = !!trimmed;
+  if (!trimmed) {
+    clearLegacyKeyStorage('wm-widget-key');
+    return;
+  }
+  void migrateLegacyKeysToHttpOnlySession({ widgetKey: trimmed })
+    .catch(() => { /* caller can retry; no new JS-readable write */ });
 }
 
 export function setProKey(key: string): void {
-  setDomainCookie('wm-pro-key', key);
-  try { localStorage.setItem('wm-pro-key', key); } catch { /* ignore */ }
+  const trimmed = key.trim();
+  proSessionHint = !!trimmed;
+  if (!trimmed) {
+    clearLegacyKeyStorage('wm-pro-key');
+    return;
+  }
+  void migrateLegacyKeysToHttpOnlySession({ proKey: trimmed })
+    .catch(() => { /* caller can retry; no new JS-readable write */ });
 }
 
 export function isWidgetFeatureEnabled(): boolean {
-  return !!getKey('wm-widget-key');
+  migrateLegacyKeyStorage();
+  return widgetSessionHint;
 }
 
 export function getWidgetAgentKey(): string {
-  return getKey('wm-widget-key');
+  migrateLegacyKeyStorage();
+  return '';
 }
 
 export function getBrowserTesterKeys(): string[] {
@@ -165,7 +173,8 @@ export function getBrowserTesterKey(): string {
 }
 
 export function isProWidgetEnabled(): boolean {
-  return !!getKey('wm-pro-key');
+  migrateLegacyKeyStorage();
+  return proSessionHint;
 }
 
 export function isProUser(): boolean {
@@ -178,22 +187,6 @@ export function isProUser(): boolean {
 }
 
 export function getProWidgetKey(): string {
-  return getKey('wm-pro-key');
-}
-
-function cleanSpanEntry(storageKey: string, panelId: string): void {
-  try {
-    const raw = localStorage.getItem(storageKey);
-    if (!raw) return;
-    const spans = JSON.parse(raw) as Record<string, number>;
-    if (!(panelId in spans)) return;
-    delete spans[panelId];
-    if (Object.keys(spans).length === 0) {
-      localStorage.removeItem(storageKey);
-    } else {
-      localStorage.setItem(storageKey, JSON.stringify(spans));
-    }
-  } catch {
-    // ignore
-  }
+  migrateLegacyKeyStorage();
+  return '';
 }

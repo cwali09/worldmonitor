@@ -11,7 +11,7 @@
  * UI code calls startCheckout(productId) -- everything else is internal.
  */
 
-import * as Sentry from '@sentry/browser';
+import { enqueueSentryCall } from '@/bootstrap/sentry-defer';
 import { DodoPayments } from 'dodopayments-checkout';
 import type { CheckoutEvent } from 'dodopayments-checkout';
 import { openBillingPortal, prereserveBillingPortalTab } from './billing';
@@ -22,9 +22,12 @@ import {
   classifyHttpCheckoutError,
   classifySyntheticCheckoutError,
   classifyThrownCheckoutError,
+  parseCheckoutErrorBody,
+  snapshotUpstreamResponse,
   type CheckoutError,
   type CheckoutErrorBody,
   type CheckoutErrorCode,
+  type UpstreamSnapshot,
 } from './checkout-errors';
 import { showCheckoutErrorToast } from './checkout-error-toast';
 import { decideNoUserPathOutcome } from './checkout-no-user-policy';
@@ -60,7 +63,7 @@ const CHECKOUT_REFERRAL_PARAM = 'checkoutReferral';
 const CHECKOUT_DISCOUNT_PARAM = 'checkoutDiscount';
 const PENDING_CHECKOUT_KEY = 'wm-pending-checkout';
 const POST_CHECKOUT_FLAG_KEY = 'wm-post-checkout';
-const APP_CHECKOUT_BASE_URL = 'https://worldmonitor.app/';
+const APP_CHECKOUT_BASE_URL = 'https://worldmonitor.app/dashboard';
 
 /**
  * Session flag set just before the post-overlay reload. Lets panel-layout
@@ -222,29 +225,29 @@ export function initCheckoutOverlay(onSuccess?: () => void): void {
     successFired = true;
     stopWatchdog();
 
-    Sentry.addBreadcrumb({
+    enqueueSentryCall((s) => s.addBreadcrumb({
       category: 'checkout',
       message: `terminal success (${reason})`,
       level: 'info',
       data: { reason },
-    });
+    }));
     if (reason === 'watchdog') {
       // Counter-signal so Dodo's wallet-return deadlock prevalence is
       // measurable in Sentry. `info` level, not `error`, per
       // feedback_sentry_level_expected_user_states.
-      Sentry.captureMessage('Dodo wallet-return deadlock — watchdog resolved', {
+      enqueueSentryCall((s) => s.captureMessage('Dodo wallet-return deadlock — watchdog resolved', {
         level: 'info',
         tags: { component: 'dodo-checkout', code: 'watchdog_resolved' },
-      });
+      }));
     }
 
     try {
       onSuccessCallback?.();
     } catch (err) {
       console.error('[checkout] onSuccessCallback threw:', err);
-      Sentry.captureException(err, {
+      enqueueSentryCall((s) => s.captureException(err, {
         tags: { component: 'dodo-checkout', action: 'on-success' },
-      });
+      }));
     }
     // Terminal success: clear both keys. LAST_CHECKOUT_ATTEMPT_KEY
     // is no longer needed (no retry context required); PENDING is
@@ -357,7 +360,7 @@ export function initCheckoutOverlay(onSuccess?: () => void): void {
         }
         case 'checkout.error':
           console.error('[checkout] Overlay error:', event.data?.message);
-          Sentry.captureMessage(`Dodo checkout overlay error: ${event.data?.message || 'unknown'}`, { level: 'error', tags: { component: 'dodo-checkout' } });
+          enqueueSentryCall((s) => s.captureMessage(`Dodo checkout overlay error: ${event.data?.message || 'unknown'}`, { level: 'error', tags: { component: 'dodo-checkout' } }));
           // Release the user if their overlay surfaces an error. The
           // deadlock bug (payment-link 404 + render loop) never reaches
           // this branch — it traps inside their iframe — but any error
@@ -736,9 +739,21 @@ export async function startCheckout(
     });
 
     if (!resp.ok) {
-      const body = (await resp.json().catch(() => ({}))) as CheckoutErrorBody;
+      // Read body as text FIRST so we can both snapshot it for Sentry
+      // (Cloudflare / Vercel deployment-protection 403s are HTML, not
+      // JSON — the old `resp.json().catch(() => ({}))` swallowed the
+      // smoking-gun page) AND still attempt structured-body parsing
+      // for our own JSON error envelopes. WORLDMONITOR-RN.
+      const rawText = await resp.text().catch(() => '');
+      const upstream = snapshotUpstreamResponse(resp, rawText);
+      // parseCheckoutErrorBody returns {} for invalid JSON AND for valid
+      // JSON that isn't a plain object (null / array / primitive), making
+      // the implicit "body is CheckoutErrorBody-shaped" contract true at
+      // runtime — defensive against future consumers that don't add their
+      // own optional chaining. Greptile P2 review of PR #3894.
+      const body = parseCheckoutErrorBody(rawText);
       const error = classifyHttpCheckoutError(resp.status, body);
-      reportCheckoutError(error, { productId, action: 'http-error' });
+      reportCheckoutError(error, { productId, action: 'http-error' }, undefined, upstream);
       // 409 duplicate-subscription — confirm with the user BEFORE
       // navigating to the billing portal. Previously the portal opened
       // silently in a new tab, which was disorienting for users who
@@ -773,11 +788,15 @@ export async function startCheckout(
       // inline so the post-auth Clerk listener can auto-resume the
       // exact checkout without manual re-click.
       //
-      // 403 is intentionally NOT routed here: 403 = valid auth but
-      // forbidden action (banned account, plan-tier mismatch, etc.).
-      // Reopening sign-in would not change the outcome and would
-      // confuse the user. 403 falls through to the normal error
-      // surface (toast) below.
+      // 403 is intentionally NOT routed here. Neither api/create-checkout.ts
+      // nor the Convex /relay/create-checkout handler ever emits 403 —
+      // observed 403s on this route originate above our function
+      // (Cloudflare Bot Fight Mode on datacenter IPs, Vercel Deployment
+      // Protection, a client-side proxy/extension, etc.). 403 maps to
+      // service_unavailable + retryable=true in the classifier so the
+      // user sees retry-friendly copy; reopening sign-in wouldn't help.
+      // The `upstream` snapshot captured above identifies which layer
+      // emitted it (WORLDMONITOR-RN).
       if (error.code === 'unauthorized' || error.code === 'session_expired') {
         savePendingCheckoutIntent({
           productId,
@@ -846,6 +865,7 @@ function reportCheckoutError(
   error: CheckoutError,
   context: { productId: string; action: string },
   caught?: unknown,
+  upstream?: UpstreamSnapshot,
 ): void {
   const level: SentryLevel = INFO_LEVEL_CODES.has(error.code) ? 'info' : 'error';
   const payload = {
@@ -854,18 +874,24 @@ function reportCheckoutError(
       component: 'dodo-checkout',
       action: context.action,
       code: error.code,
+      // Promote cf-ray and server to tags so they're filterable in the
+      // Sentry UI without opening the event. cf-ray presence alone is
+      // definitive for Cloudflare emission. WORLDMONITOR-RN.
+      ...(upstream?.cfRay ? { cfRay: upstream.cfRay } : {}),
+      ...(upstream?.server ? { upstreamServer: upstream.server } : {}),
     },
     extra: {
       productId: context.productId,
       httpStatus: error.httpStatus,
       serverMessage: error.serverMessage,
+      ...(upstream ? { upstream } : {}),
     },
   };
   if (!shouldSkipSentryForAction(context.action)) {
     if (caught) {
-      Sentry.captureException(caught, payload);
+      enqueueSentryCall((s) => s.captureException(caught, payload));
     } else {
-      Sentry.captureMessage(`Checkout error: ${error.code}`, payload);
+      enqueueSentryCall((s) => s.captureMessage(`Checkout error: ${error.code}`, payload));
     }
   }
   const logger = level === 'info' ? console.info : console.error;
@@ -1059,10 +1085,10 @@ export function showCheckoutSuccess(
     _currentBannerCleanup = null;
     currentState = 'timeout';
     setBannerText(banner, 'timeout', currentMaskedEmail);
-    Sentry.captureMessage('Checkout entitlement-activation timeout', {
+    enqueueSentryCall((s) => s.captureMessage('Checkout entitlement-activation timeout', {
       level: 'warning',
       tags: { component: 'dodo-checkout', action: 'entitlement-timeout' },
-    });
+    }));
   }, EXTENDED_UNLOCK_TIMEOUT_MS);
 
   const unsubscribe = onEntitlementChange(() => {

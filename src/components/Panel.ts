@@ -1,11 +1,24 @@
 import { isDesktopRuntime } from '../services/runtime';
 import { invokeTauri } from '../services/tauri-bridge';
 import { t } from '../services/i18n';
-import { h, replaceChildren, safeHtml } from '../utils/dom-utils';
+import { h, replaceChildren, safeHtml as sanitizeHtmlFragment, setTrustedHtml, trustedHtml } from '../utils/dom-utils';
+import { safeHtmlToString, type SafeHtml } from '@/utils/sanitize';
 import { trackPanelResized } from '@/services/analytics';
 import { getAiFlowSettings } from '@/services/ai-flow-settings';
 import { getSecretState } from '@/services/runtime-config';
 import { PanelGateReason } from '@/services/panel-gating';
+import { dataFreshness, type PanelFreshnessSummary } from '@/services/data-freshness';
+import { formatPanelFreshnessDisplay } from '@/services/panel-freshness-display';
+import {
+  clearPanelColSpan,
+  clearPanelSpan,
+  loadPanelCollapsed,
+  loadPanelColSpans,
+  loadPanelSpans,
+  savePanelCollapsed,
+  savePanelColSpan,
+  savePanelSpan,
+} from '@/utils/panel-storage';
 
 export type PanelSeverity = 'critical' | 'high' | 'medium' | 'low' | 'none';
 
@@ -26,78 +39,10 @@ const lockSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" 
 
 const upgradeSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="16 12 12 8 8 12"/><line x1="12" y1="16" x2="12" y2="8"/></svg>`;
 
-const PANEL_SPANS_KEY = 'worldmonitor-panel-spans';
-
-function loadPanelSpans(): Record<string, number> {
-  try {
-    const stored = localStorage.getItem(PANEL_SPANS_KEY);
-    return stored ? JSON.parse(stored) : {};
-  } catch {
-    return {};
-  }
-}
-
-function savePanelSpan(panelId: string, span: number): void {
-  const spans = loadPanelSpans();
-  spans[panelId] = span;
-  localStorage.setItem(PANEL_SPANS_KEY, JSON.stringify(spans));
-}
-
-const PANEL_COL_SPANS_KEY = 'worldmonitor-panel-col-spans';
 const ROW_RESIZE_STEP_PX = 80;
 const COL_RESIZE_STEP_PX = 80;
 const PANELS_GRID_MIN_TRACK_PX = 280;
-
-function loadPanelColSpans(): Record<string, number> {
-  try {
-    const stored = localStorage.getItem(PANEL_COL_SPANS_KEY);
-    return stored ? JSON.parse(stored) : {};
-  } catch {
-    return {};
-  }
-}
-
-function savePanelColSpan(panelId: string, span: number): void {
-  const spans = loadPanelColSpans();
-  spans[panelId] = span;
-  localStorage.setItem(PANEL_COL_SPANS_KEY, JSON.stringify(spans));
-}
-
-const PANEL_COLLAPSED_KEY = 'worldmonitor-panel-collapsed';
-
-function loadPanelCollapsed(): Record<string, boolean> {
-  try {
-    const stored = localStorage.getItem(PANEL_COLLAPSED_KEY);
-    return stored ? JSON.parse(stored) : {};
-  } catch {
-    return {};
-  }
-}
-
-function savePanelCollapsed(panelId: string, collapsed: boolean): void {
-  const map = loadPanelCollapsed();
-  if (collapsed) {
-    map[panelId] = true;
-  } else {
-    delete map[panelId];
-  }
-  if (Object.keys(map).length === 0) {
-    localStorage.removeItem(PANEL_COLLAPSED_KEY);
-  } else {
-    localStorage.setItem(PANEL_COLLAPSED_KEY, JSON.stringify(map));
-  }
-}
-
-function clearPanelColSpan(panelId: string): void {
-  const spans = loadPanelColSpans();
-  if (!(panelId in spans)) return;
-  delete spans[panelId];
-  if (Object.keys(spans).length === 0) {
-    localStorage.removeItem(PANEL_COL_SPANS_KEY);
-    return;
-  }
-  localStorage.setItem(PANEL_COL_SPANS_KEY, JSON.stringify(spans));
-}
+const FRESHNESS_BADGE_REFRESH_MS = 60_000;
 
 function getDefaultColSpan(element: HTMLElement): number {
   return element.classList.contains('panel-wide') ? 2 : 1;
@@ -203,6 +148,9 @@ export class Panel {
   protected countEl: HTMLElement | null = null;
   protected statusBadgeEl: HTMLElement | null = null;
   protected newBadgeEl: HTMLElement | null = null;
+  private freshnessBadgeEl: HTMLElement | null = null;
+  private freshnessUnsubscribe: (() => void) | null = null;
+  private freshnessRefreshTimer: ReturnType<typeof setInterval> | null = null;
   private severityDotEl: HTMLElement | null = null;
   private currentSeverity: PanelSeverity = 'none';
   protected panelId: string;
@@ -248,6 +196,8 @@ export class Panel {
   private _savedContent: ChildNode[] | null = null;
   private _collapsed = false;
   private _collapseBtn: HTMLButtonElement | null = null;
+  private viewportObserver: IntersectionObserver | null = null;
+  private viewportObserverRegistered = false;
 
   constructor(options: PanelOptions) {
     this.panelId = options.id;
@@ -271,11 +221,24 @@ export class Panel {
     this.severityDotEl.setAttribute('aria-hidden', 'true');
     headerLeft.appendChild(this.severityDotEl);
 
+    const initialFreshness = dataFreshness.getPanelFreshness(this.panelId);
+    if (initialFreshness) {
+      this.freshnessBadgeEl = document.createElement('span');
+      this.freshnessBadgeEl.className = 'panel-freshness-badge';
+      headerLeft.appendChild(this.freshnessBadgeEl);
+      this.updateFreshnessBadge(initialFreshness);
+      this.freshnessUnsubscribe = dataFreshness.subscribe(() => this.updateFreshnessBadge());
+      this.freshnessRefreshTimer = setInterval(
+        () => this.updateFreshnessBadge(),
+        FRESHNESS_BADGE_REFRESH_MS,
+      );
+    }
+
     if (options.infoTooltip) {
       const infoBtn = h('button', { className: 'panel-info-btn', 'aria-label': t('components.panel.showMethodologyInfo') }, '?');
 
       const tooltip = h('div', { className: 'panel-info-tooltip' });
-      tooltip.appendChild(safeHtml(options.infoTooltip));
+      tooltip.appendChild(sanitizeHtmlFragment(options.infoTooltip));
 
       infoBtn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -702,6 +665,20 @@ export class Panel {
     this.statusBadgeEl.style.display = 'none';
   }
 
+  private updateFreshnessBadge(summary: PanelFreshnessSummary | null = dataFreshness.getPanelFreshness(this.panelId)): void {
+    if (!this.freshnessBadgeEl) return;
+    if (!summary) {
+      this.freshnessBadgeEl.style.display = 'none';
+      return;
+    }
+    const display = formatPanelFreshnessDisplay(summary);
+    this.freshnessBadgeEl.textContent = display.label;
+    this.freshnessBadgeEl.className = `panel-freshness-badge panel-freshness-${summary.status}`;
+    this.freshnessBadgeEl.title = display.title;
+    this.freshnessBadgeEl.setAttribute('aria-label', display.ariaLabel);
+    this.freshnessBadgeEl.style.display = 'inline-flex';
+  }
+
   protected insertLiveCountBadge(count: number): void {
     const headerLeft = this.header.querySelector('.panel-header-left');
     if (!headerLeft) return;
@@ -758,6 +735,54 @@ export class Panel {
 
   public getElement(): HTMLElement {
     return this.element;
+  }
+
+  /**
+   * Fire `callback` once when this panel's element scrolls within
+   * `marginPx` of the viewport. Uses IntersectionObserver where
+   * available; falls back to an idle-callback tick when not (Node/SSR
+   * or very old browsers). Idempotent — repeat calls are ignored
+   * once an observation is registered. Disconnected automatically on
+   * destroy() and on first firing (loadAllData is idempotent and the
+   * refresh scheduler owns repeat fetches, so re-firing is wasted
+   * work). (#3990)
+   */
+  public observeNearViewport(callback: () => void, marginPx = 200): void {
+    if (this.viewportObserverRegistered) return;
+    if (typeof IntersectionObserver === 'undefined' || typeof window === 'undefined') {
+      this.viewportObserverRegistered = true;
+      const tick = (): void => {
+        if (this.element.isConnected) callback();
+      };
+      // typeof window === 'undefined' takes the fallback branch alone (no IO + no
+      // window), so the requestIdleCallback lookup must be gated separately —
+      // dereferencing `window` here without that guard would ReferenceError in
+      // pure Node/SSR. Greptile #4001/P1.
+      const ric = typeof window !== 'undefined'
+        ? (window as unknown as { requestIdleCallback?: (cb: () => void) => number }).requestIdleCallback
+        : undefined;
+      if (typeof ric === 'function') ric(tick);
+      else setTimeout(tick, 0);
+      return;
+    }
+    this.viewportObserverRegistered = true;
+    this.viewportObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) {
+          this.unobserveViewport();
+          callback();
+          return;
+        }
+      }
+    }, { rootMargin: `${marginPx}px` });
+    this.viewportObserver.observe(this.element);
+  }
+
+  private unobserveViewport(): void {
+    if (this.viewportObserver) {
+      this.viewportObserver.disconnect();
+      this.viewportObserver = null;
+    }
   }
 
   public isNearViewport(marginPx = 400): boolean {
@@ -847,7 +872,7 @@ export class Panel {
     this.element.classList.add('panel-is-locked');
 
     const iconEl = h('div', { className: 'panel-locked-icon' });
-    iconEl.innerHTML = lockSvg;
+    setTrustedHtml(iconEl, trustedHtml(lockSvg, 'legacy direct innerHTML migration'));
 
     const lockedChildren: (HTMLElement | string)[] = [
       iconEl,
@@ -909,7 +934,7 @@ export class Panel {
     this.element.classList.add('panel-is-locked');
 
     const iconEl = h('div', { className: 'panel-locked-icon' });
-    iconEl.innerHTML = entry.icon;
+    setTrustedHtml(iconEl, trustedHtml(entry.icon, 'legacy direct innerHTML migration'));
 
     const descEl = h('div', { className: 'panel-locked-desc' }, entry.desc);
 
@@ -1041,7 +1066,11 @@ export class Panel {
     }
   }
 
-  public setContent(html: string): void {
+  public setSafeContent(html: SafeHtml): void {
+    this.setContentHtml(safeHtmlToString(html));
+  }
+
+  private setContentHtml(html: string): void {
     if (this._locked) return;
     this.setErrorState(false);
     this.clearRetryCountdown();
@@ -1070,7 +1099,7 @@ export class Panel {
 
     this.pendingContentHtml = null;
     if (this.content.innerHTML !== html) {
-      this.content.innerHTML = html;
+      setTrustedHtml(this.content, trustedHtml(html, 'legacy direct innerHTML migration'));
     }
   }
 
@@ -1146,9 +1175,7 @@ export class Panel {
    */
   public resetHeight(): void {
     this.element.classList.remove('resized', 'span-1', 'span-2', 'span-3', 'span-4');
-    const spans = loadPanelSpans();
-    delete spans[this.panelId];
-    localStorage.setItem(PANEL_SPANS_KEY, JSON.stringify(spans));
+    clearPanelSpan(this.panelId);
   }
 
   public resetWidth(): void {
@@ -1167,6 +1194,15 @@ export class Panel {
   public destroy(): void {
     this.abortController.abort();
     this.clearRetryCountdown();
+    this.unobserveViewport();
+    if (this.freshnessUnsubscribe) {
+      this.freshnessUnsubscribe();
+      this.freshnessUnsubscribe = null;
+    }
+    if (this.freshnessRefreshTimer) {
+      clearInterval(this.freshnessRefreshTimer);
+      this.freshnessRefreshTimer = null;
+    }
     if (this.colSpanReconcileRaf !== null) {
       cancelAnimationFrame(this.colSpanReconcileRaf);
       this.colSpanReconcileRaf = null;

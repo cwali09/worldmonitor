@@ -11,17 +11,31 @@ import {
   ALL_PANELS,
   VARIANT_DEFAULTS,
   getEffectivePanelConfig,
+  enforceFreePanelLimit,
   FREE_MAX_PANELS,
   FREE_MAX_SOURCES,
 } from '@/config';
 import { sanitizeLayersForVariant } from '@/config/map-layer-definitions';
 import type { MapVariant } from '@/config/map-layer-definitions';
-import { initDB, cleanOldSnapshots, isAisConfigured, initAisStream, isOutagesConfigured, disconnectAisStream } from '@/services';
+import { getStoredMapModePreference } from '@/services/map-mode-preference';
+import {
+  initDB,
+  cleanOldSnapshots,
+  isAisConfigured,
+  initAisStream,
+  isOutagesConfigured,
+  disconnectAisStream,
+  startFlightHistoryCleanup,
+  startVesselHistoryCleanup,
+  stopFlightHistoryCleanup,
+  stopVesselHistoryCleanup,
+} from '@/services';
 import { isProUser } from '@/services/widget-store';
 import { mlWorker } from '@/services/ml-worker';
 import { getAiFlowSettings, subscribeAiFlowChange, isHeadlineMemoryEnabled } from '@/services/ai-flow-settings';
 import { startLearning } from '@/services/country-instability';
 import { loadFromStorage, parseMapUrlState, saveToStorage, isMobileDevice } from '@/utils';
+import { clearPanelSpans, invalidatePanelStorageCacheForKeys } from '@/utils/panel-storage';
 import type { ParsedMapUrlState } from '@/utils';
 import { SignalModal, IntelligenceGapBadge, BreakingNewsBanner } from '@/components';
 import { initBreakingNewsAlerts, destroyBreakingNewsAlerts } from '@/services/breaking-news-alerts';
@@ -73,6 +87,7 @@ import { describeFreshness } from '@/services/persistent-cache';
 import { DesktopUpdater } from '@/app/desktop-updater';
 import { CountryIntelManager } from '@/app/country-intel';
 import { registerWebMcpTools } from '@/services/webmcp';
+import { refreshDataFreshnessFromHealth } from '@/services/health-freshness';
 import { SearchManager } from '@/app/search-manager';
 import { RefreshScheduler } from '@/app/refresh-scheduler';
 import { PanelLayoutManager } from '@/app/panel-layout';
@@ -81,10 +96,21 @@ import { EventHandlerManager } from '@/app/event-handlers';
 import { resolveUserRegion, resolvePreciseUserCoordinates, type PreciseCoordinates } from '@/utils/user-location';
 import { showProBanner } from '@/components/ProBanner';
 import { initAuthState, subscribeAuthState } from '@/services/auth-state';
-import { install as installCloudPrefsSync, onSignIn as cloudPrefsSignIn, onSignOut as cloudPrefsSignOut } from '@/utils/cloud-prefs-sync';
+import {
+  CLOUD_PREFS_APPLIED_EVENT,
+  install as installCloudPrefsSync,
+  onSignIn as cloudPrefsSignIn,
+  onSignOut as cloudPrefsSignOut,
+  type CloudPrefsAppliedDetail,
+} from '@/utils/cloud-prefs-sync';
 import { getConvexClient, getConvexApi, waitForConvexAuth } from '@/services/convex-client';
 import { initEntitlementSubscription, destroyEntitlementSubscription, resetEntitlementState, onEntitlementChange } from '@/services/entitlements';
 import { initSubscriptionWatch, destroySubscriptionWatch } from '@/services/billing';
+import {
+  FREE_TIER_FOLLOW_LIMIT,
+  WM_FOLLOWED_COUNTRIES_CAP_DROP,
+  installFollowedCountriesAuthListener,
+} from '@/services/followed-countries';
 import {
   capturePendingCheckoutIntentFromUrl,
   initCheckoutWatchers,
@@ -136,6 +162,7 @@ export class App {
   private webMcpController: AbortController | null = null;
   private visiblePanelPrimed = new Set<string>();
   private visiblePanelPrimeRaf: number | null = null;
+  private followedCountriesCapDropToastTimer: number | null = null;
   private bootstrapHydrationState: BootstrapHydrationState = getBootstrapHydrationState();
   private cachedModeBannerEl: HTMLElement | null = null;
   private readonly handleViewportPrime = (): void => {
@@ -143,11 +170,79 @@ export class App {
     this.visiblePanelPrimeRaf = window.requestAnimationFrame(() => {
       this.visiblePanelPrimeRaf = null;
       void this.primeVisiblePanelData();
+      // loadAllData covers panels primeVisiblePanelData does not (news,
+      // markets, intelligence, fred, …). Now that bootstrap runs with
+      // forceAll=false, below-fold panels need this re-trigger on scroll
+      // so their data lands when they enter the viewport. Both are
+      // viewport-gated and inflight-guarded — repeat invocations are
+      // cheap.
+      void this.dataLoader.loadAllData();
     });
   };
   private readonly handleConnectivityChange = (): void => {
     this.updateConnectivityUi();
   };
+  private readonly handleFollowedCountriesCapDrop = (ev: Event): void => {
+    const detail = (ev as CustomEvent<{ kept?: unknown; dropped?: unknown }>).detail;
+    const dropped = typeof detail?.dropped === 'number' ? detail.dropped : 0;
+    const kept = typeof detail?.kept === 'number' ? detail.kept : FREE_TIER_FOLLOW_LIMIT;
+    if (dropped <= 0) return;
+    this.showFollowedCountriesCapDropToast(kept, dropped);
+  };
+  private readonly handleCloudPrefsApplied = (ev: Event): void => {
+    const keys = (ev as CustomEvent<CloudPrefsAppliedDetail>).detail?.keys ?? [];
+    this.applyCloudSyncedPrefsToRuntime(keys);
+  };
+
+  private applyCloudSyncedPrefsToRuntime(keys: readonly string[]): void {
+    if (keys.length === 0) return;
+
+    const keySet = new Set(keys);
+    invalidatePanelStorageCacheForKeys(keys);
+
+    if (keySet.has(STORAGE_KEYS.panels)) {
+      this.state.panelSettings = loadFromStorage<Record<string, PanelConfig>>(
+        STORAGE_KEYS.panels,
+        this.state.panelSettings,
+      );
+      this.panelLayout.applyPanelSettings();
+      this.state.unifiedSettings?.refreshPanelToggles();
+    }
+
+    const panelOrderKey = this.state.PANEL_ORDER_KEY;
+    if (keySet.has(panelOrderKey) || keySet.has(`${panelOrderKey}-bottom-set`)) {
+      this.panelLayout.applySavedPanelOrder();
+    }
+
+    if (keySet.has(STORAGE_KEYS.mapLayers) && !this.state.initialUrlState?.layers) {
+      const nextLayers = normalizeExclusiveChoropleths(
+        sanitizeLayersForVariant(
+          loadFromStorage<MapLayers>(STORAGE_KEYS.mapLayers, this.state.mapLayers),
+          SITE_VARIANT as MapVariant,
+        ),
+        this.state.mapLayers,
+      );
+      if (!CYBER_LAYER_ENABLED) nextLayers.cyberThreats = false;
+      this.state.mapLayers = nextLayers;
+      this.state.map?.setLayers(nextLayers);
+      this.dataLoader.syncDataFreshnessWithLayers();
+    }
+
+    if (keySet.has(STORAGE_KEYS.mapMode)) {
+      const mode = getStoredMapModePreference();
+      if (mode === 'globe') this.state.map?.switchToGlobe();
+      else this.state.map?.switchToFlat();
+    }
+
+    if (keySet.has(STORAGE_KEYS.disabledFeeds)) {
+      this.state.disabledSources = new Set(loadFromStorage<string[]>(STORAGE_KEYS.disabledFeeds, []));
+    }
+
+    if (keySet.has(STORAGE_KEYS.monitors)) {
+      this.state.monitors = loadFromStorage<Monitor[]>(STORAGE_KEYS.monitors, []);
+      this.dataLoader.updateMonitorResults();
+    }
+  }
 
   private isPanelNearViewport(panelId: string, marginPx = 400): boolean {
     const panel = this.state.panels[panelId] as { isNearViewport?: (marginPx?: number) => boolean } | undefined;
@@ -492,7 +587,7 @@ export class App {
     let panelSettings: Record<string, PanelConfig>;
 
     // Panels that must survive variant switches: desktop config, user-created widgets, MCP panels.
-    const isDynamicPanel = (k: string) => k === 'runtime-config' || k.startsWith('cw-') || k.startsWith('mcp-');
+    const isDynamicPanel = (k: string) => !ALL_PANELS[k] && (k === 'runtime-config' || k.startsWith('cw-') || k.startsWith('mcp-'));
 
     // Check if variant changed - reset all settings to variant defaults
     const storedVariant = localStorage.getItem('worldmonitor-variant');
@@ -694,7 +789,7 @@ export class App {
         localStorage.removeItem(PANEL_ORDER_KEY);
         localStorage.removeItem(PANEL_ORDER_KEY + '-bottom');
         localStorage.removeItem(PANEL_ORDER_KEY + '-bottom-set');
-        localStorage.removeItem(PANEL_SPANS_KEY);
+        clearPanelSpans();
         console.log('[App] Applied layout reset migration (v2.5): cleared panel order/spans');
       }
       localStorage.setItem(LAYOUT_RESET_MIGRATION_KEY, 'done');
@@ -733,8 +828,19 @@ export class App {
         const total = getTotalFeedCount();
         console.log(`[App] Sources reduction: ${defaultDisabled.length} disabled, ${total - defaultDisabled.length} enabled`);
       }
-      // Locale boost: additively enable locale-matched sources (runs once per locale)
-      const userLang = ((navigator.language ?? 'en').split('-')[0] ?? 'en').toLowerCase();
+      // Locale boost: additively enable locale-matched sources (runs once per locale).
+      // Reads the explicit-choice key (`wm-locale-explicit`, written by Settings →
+      // Language) before falling back to navigator. Mirrors the i18n.ts:99
+      // `wmExplicit` detector — without this, a user whose browser is en-US who
+      // picks Magyar in Settings never gets the locale boost (the migration's
+      // first run with `userLang='en'` sets `worldmonitor-locale-boost-en` and
+      // the `userLang !== 'en'` short-circuit means the boost block never re-fires
+      // for any subsequent locale choice). Direct localStorage read because
+      // i18next isn't initialized yet here in the constructor — `initI18n()` is
+      // called later inside `init()`.
+      let explicitLocale = '';
+      try { explicitLocale = localStorage.getItem('wm-locale-explicit') || ''; } catch { /* private mode */ }
+      const userLang = ((explicitLocale || navigator.language || 'en').split('-')[0] ?? 'en').toLowerCase();
       const localeKey = `worldmonitor-locale-boost-${userLang}`;
       if (userLang !== 'en' && !localStorage.getItem(localeKey)) {
         const boosted = getLocaleBoostedSources(userLang);
@@ -819,6 +925,7 @@ export class App {
 
     this.searchManager = new SearchManager(this.state, {
       openCountryBriefByCode: (code, country) => this.countryIntel.openCountryBriefByCode(code, country),
+      enablePanel: (panelId) => this.eventHandlers.enablePanelById(panelId),
     });
 
     this.panelLayout = new PanelLayoutManager(this.state, {
@@ -830,6 +937,7 @@ export class App {
       loadAllData: () => this.dataLoader.loadAllData(),
       updateMonitorResults: () => this.dataLoader.updateMonitorResults(),
       loadSecurityAdvisories: () => this.dataLoader.loadSecurityAdvisories(),
+      applyMapLayerChange: (layer, enabled, source) => this.eventHandlers.applyMapLayerChange(layer, enabled, source),
     });
 
     this.eventHandlers = new EventHandlerManager(this.state, {
@@ -841,7 +949,8 @@ export class App {
       waitForAisData: () => this.dataLoader.waitForAisData(),
       syncDataFreshnessWithLayers: () => this.dataLoader.syncDataFreshnessWithLayers(),
       ensureCorrectZones: () => this.panelLayout.ensureCorrectZones(),
-      refreshOpenCountryBrief: () => this.countryIntel.refreshOpenBrief(),
+      applySavedPanelOrder: (panelOrder?: string[]) => this.panelLayout.applySavedPanelOrder(panelOrder),
+      refreshCiiAfterFocalPointsReady: () => this.dataLoader.refreshCiiAfterFocalPointsReady(),
       stopLayerActivity: (layer) => this.dataLoader.stopLayerActivity(layer),
       mountLiveNewsIfReady: () => this.panelLayout.mountLiveNewsIfReady(),
       updateFlightSource: (adsb, military) => this.searchManager.updateFlightSource(adsb, military),
@@ -892,6 +1001,8 @@ export class App {
     });
 
     await initDB();
+    startFlightHistoryCleanup();
+    startVesselHistoryCleanup();
     await initI18n();
     // Localize the static index.html shell — <title>, meta description, and
     // sr-only <h1> are baked in English so search crawlers see something
@@ -998,6 +1109,12 @@ export class App {
     await initAuthState();
     initAuthAnalytics();
     installCloudPrefsSync(SITE_VARIANT);
+    window.addEventListener(CLOUD_PREFS_APPLIED_EVENT, this.handleCloudPrefsApplied);
+    // Install the followed-countries auth listener once. Drives the
+    // anon→signed-in handoff (mergeAnonymousLocal mutation) and sign-out
+    // cleanup. Idempotent.
+    installFollowedCountriesAuthListener();
+    window.addEventListener(WM_FOLLOWED_COUNTRIES_CAP_DROP, this.handleFollowedCountriesCapDrop);
     this.enforceFreeTierLimits();
 
     let _prevUserId: string | null = null;
@@ -1142,10 +1259,8 @@ export class App {
       });
     }
 
-    if (!this.state.isMobile) {
-      initBreakingNewsAlerts();
-      this.state.breakingBanner = new BreakingNewsBanner();
-    }
+    initBreakingNewsAlerts();
+    this.state.breakingBanner = new BreakingNewsBanner();
 
     // Phase 3: UI setup methods
     this.eventHandlers.startHeaderClock();
@@ -1166,7 +1281,7 @@ export class App {
     this.eventHandlers.setupAuthWidget();
     // Capture any ?ref= / ?wm_referral= from the URL into localStorage
     // and strip from the visible URL. Runs BEFORE the pending-checkout
-    // capture so a /pro?ref=X&checkoutProduct=Y landing preserves both
+    // capture so a /dashboard?ref=X&checkoutProduct=Y landing preserves both
     // signals. Pure read of current URL — no-op when neither param is
     // present.
     captureReferralFromUrl();
@@ -1205,6 +1320,9 @@ export class App {
     const earlyParams = new URLSearchParams(window.location.search);
     this.pendingDeepLinkStoryCode = earlyParams.get('c') ?? null;
     this.eventHandlers.setupUrlStateSync();
+    if (import.meta.env.VITE_E2E === '1') {
+      document.documentElement.dataset.wmEventHandlersReady = 'true';
+    }
 
     this.state.countryBriefPage?.onStateChange?.(() => {
       this.eventHandlers.syncUrlState();
@@ -1223,9 +1341,15 @@ export class App {
     // panels from being blocked when a loadAllData batch is slow.
     window.addEventListener('scroll', this.handleViewportPrime, { passive: true });
     window.addEventListener('resize', this.handleViewportPrime);
+    // forceAll=false at bootstrap: data-loader's existing per-panel
+    // viewport gate (shouldLoad(id) = forceAll || isPanelNearViewport(id))
+    // now actually fires, cutting the ~80-request fan-out down to the
+    // panels currently above the fold. IntersectionObserver wiring in
+    // panel-layout.ts plus handleViewportPrime above re-trigger
+    // loadAllData() as below-fold panels enter the viewport. (#3990)
     await Promise.all([
-      this.dataLoader.loadAllData(true),
-      this.primeVisiblePanelData(true),
+      this.dataLoader.loadAllData(),
+      this.primeVisiblePanelData(),
     ]);
 
     // If bootstrap was served from cache but live data just loaded, promote the status indicator
@@ -1311,26 +1435,23 @@ export class App {
     if (isProUser()) return;
 
     // --- Panel limit ---
+    // Delegate to the shared enforceFreePanelLimit helper so this boot path and
+    // the dashboard-tab add/switch/load paths stay in lockstep (same cw-* and
+    // count rules). isPro is false here — the isProUser() early-return above
+    // already short-circuited pro users.
     const panelSettings = loadFromStorage<Record<string, PanelConfig>>(STORAGE_KEYS.panels, {});
-    let cwDisabled = false;
+    const clampedPanels = enforceFreePanelLimit(panelSettings, false);
+    let panelsChanged = false;
     for (const key of Object.keys(panelSettings)) {
-      if (key.startsWith('cw-') && panelSettings[key]?.enabled) {
-        panelSettings[key] = { ...panelSettings[key]!, enabled: false };
-        cwDisabled = true;
+      if (panelSettings[key]?.enabled !== clampedPanels[key]?.enabled) {
+        panelsChanged = true;
+        break;
       }
     }
-    const enabledKeys = Object.entries(panelSettings)
-      .filter(([k, v]) => v.enabled && !k.startsWith('cw-'))
-      .sort(([ka, a], [kb, b]) => (a.priority ?? 99) - (b.priority ?? 99) || ka.localeCompare(kb))
-      .map(([k]) => k);
-    const needsTrim = enabledKeys.length > FREE_MAX_PANELS;
-    if (needsTrim) {
-      for (const key of enabledKeys.slice(FREE_MAX_PANELS)) {
-        panelSettings[key] = { ...panelSettings[key]!, enabled: false };
-      }
-      console.log(`[App] Free tier: trimmed ${enabledKeys.length - FREE_MAX_PANELS} panel(s) to enforce ${FREE_MAX_PANELS}-panel limit`);
+    if (panelsChanged) {
+      saveToStorage(STORAGE_KEYS.panels, clampedPanels);
+      console.log(`[App] Free tier: enforced ${FREE_MAX_PANELS}-panel limit (disabled over-cap / cw-* panels)`);
     }
-    if (cwDisabled || needsTrim) saveToStorage(STORAGE_KEYS.panels, panelSettings);
 
     // --- Source limit ---
     // Free-tier 80-source cap. Pre-2026-05-01 this used `Array.sort().slice()`
@@ -1351,7 +1472,22 @@ export class App {
       return count;
     })();
     if (totalEligible > FREE_MAX_SOURCES) {
-      const { keep, autoDisabled } = selectSourcesUnderCap(FEEDS, INTEL_SOURCES, disabledSources, FREE_MAX_SOURCES);
+      // Protect locale-boosted sources from the cap. Without this, locale-
+      // tagged feeds that sit late in their category bucket (e.g. Hungarian
+      // entries in the Europe bucket, declared AFTER the existing en/de/it/
+      // nl/sv defaults) get round-robin'd out — the locale boost re-enables
+      // them, then the cap immediately auto-disables them again. Free-tier
+      // users on the boosted locale lose their locale's defaults entirely.
+      // userLang derivation mirrors the locale-boost migration (earlier in
+      // the App constructor) and the i18n.ts:99 `wmExplicit` detector:
+      // explicit Settings choice wins, navigator is the fallback. Direct
+      // localStorage read because i18next isn't initialized yet at the
+      // constructor stage where enforceFreeTierLimits also runs.
+      let explicitLocale = '';
+      try { explicitLocale = localStorage.getItem('wm-locale-explicit') || ''; } catch { /* private mode */ }
+      const userLang = ((explicitLocale || navigator.language || 'en').split('-')[0] ?? 'en').toLowerCase();
+      const protectedNames = userLang === 'en' ? new Set<string>() : getLocaleBoostedSources(userLang);
+      const { keep, autoDisabled } = selectSourcesUnderCap(FEEDS, INTEL_SOURCES, disabledSources, FREE_MAX_SOURCES, protectedNames);
       // Defense in depth: feeds.ts has 35+ source names that appear in
       // multiple category buckets. The helper guarantees keep ∩ autoDisabled
       // = ∅, but a regression there would silently re-disable a kept source
@@ -1371,6 +1507,8 @@ export class App {
     window.removeEventListener('resize', this.handleViewportPrime);
     window.removeEventListener('online', this.handleConnectivityChange);
     window.removeEventListener('offline', this.handleConnectivityChange);
+    window.removeEventListener(WM_FOLLOWED_COUNTRIES_CAP_DROP, this.handleFollowedCountriesCapDrop);
+    window.removeEventListener(CLOUD_PREFS_APPLIED_EVENT, this.handleCloudPrefsApplied);
     if (this.visiblePanelPrimeRaf !== null) {
       window.cancelAnimationFrame(this.visiblePanelPrimeRaf);
       this.visiblePanelPrimeRaf = null;
@@ -1389,13 +1527,88 @@ export class App {
     destroyBreakingNewsAlerts();
     this.cachedModeBannerEl?.remove();
     this.cachedModeBannerEl = null;
+    if (this.followedCountriesCapDropToastTimer !== null) {
+      window.clearTimeout(this.followedCountriesCapDropToastTimer);
+      this.followedCountriesCapDropToastTimer = null;
+    }
     this.state.map?.destroy();
     disconnectAisStream();
+    stopFlightHistoryCleanup();
+    stopVesselHistoryCleanup();
     // Unregister every WebMCP tool so a same-document re-init (tests,
     // HMR, SPA harness) doesn't leave the browser with stale bindings
     // pointing at a disposed App.
     this.webMcpController?.abort();
     this.webMcpController = null;
+  }
+
+  private showFollowedCountriesCapDropToast(kept: number, dropped: number): void {
+    if (this.followedCountriesCapDropToastTimer !== null) {
+      window.clearTimeout(this.followedCountriesCapDropToastTimer);
+      this.followedCountriesCapDropToastTimer = null;
+    }
+    document.querySelector('.wm-followed-cap-drop-toast')?.remove();
+
+    const toast = document.createElement('div');
+    toast.className = 'wm-followed-cap-drop-toast update-toast';
+    toast.setAttribute('role', 'status');
+    toast.setAttribute('aria-live', 'polite');
+
+    const body = document.createElement('div');
+    body.className = 'update-toast-body';
+
+    const title = document.createElement('div');
+    title.className = 'update-toast-title';
+    title.textContent = 'Follow limit reached';
+
+    const detail = document.createElement('div');
+    detail.className = 'update-toast-detail';
+    const countryWord = dropped === 1 ? 'country was' : 'countries were';
+    detail.textContent = `${kept} kept. ${dropped} ${countryWord} not added because the free plan supports ${FREE_TIER_FOLLOW_LIMIT} followed countries.`;
+
+    body.append(title, detail);
+
+    const action = document.createElement('button');
+    action.type = 'button';
+    action.className = 'update-toast-action';
+    action.dataset.action = 'upgrade';
+    action.textContent = 'Upgrade';
+
+    const dismiss = document.createElement('button');
+    dismiss.type = 'button';
+    dismiss.className = 'update-toast-dismiss';
+    dismiss.dataset.action = 'dismiss';
+    dismiss.setAttribute('aria-label', 'Dismiss');
+    dismiss.textContent = '\u00d7';
+
+    toast.append(body, action, dismiss);
+
+    this.followedCountriesCapDropToastTimer = window.setTimeout(() => {
+      toast.remove();
+      this.followedCountriesCapDropToastTimer = null;
+    }, 8000);
+    toast.addEventListener('click', (e) => {
+      const clickedAction = (e.target as HTMLElement)
+        .closest<HTMLElement>('[data-action]')
+        ?.dataset.action;
+      if (clickedAction === 'upgrade') {
+        window.open('/pro#pricing', '_blank', 'noopener');
+        if (this.followedCountriesCapDropToastTimer !== null) {
+          window.clearTimeout(this.followedCountriesCapDropToastTimer);
+          this.followedCountriesCapDropToastTimer = null;
+        }
+        toast.remove();
+      } else if (clickedAction === 'dismiss') {
+        if (this.followedCountriesCapDropToastTimer !== null) {
+          window.clearTimeout(this.followedCountriesCapDropToastTimer);
+          this.followedCountriesCapDropToastTimer = null;
+        }
+        toast.remove();
+      }
+    });
+
+    document.body.appendChild(toast);
+    window.requestAnimationFrame(() => toast.classList.add('visible'));
   }
 
   // Waits for Phase-4 UI modules (searchManager + countryIntel) to finish
@@ -1460,6 +1673,13 @@ export class App {
   private setupRefreshIntervals(): void {
     // Always refresh news for all variants
     this.refreshScheduler.scheduleRefresh('news', () => this.dataLoader.loadNews(), REFRESH_INTERVALS.feeds);
+    this.refreshScheduler.scheduleRefresh(
+      'health-freshness',
+      async () => { await refreshDataFreshnessFromHealth(); },
+      REFRESH_INTERVALS.healthFreshness,
+      undefined,
+      { runImmediately: true },
+    );
 
     // Happy variant only refreshes news -- skip all geopolitical/financial/military refreshes
     if (SITE_VARIANT !== 'happy') {

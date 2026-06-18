@@ -38,6 +38,73 @@ export function describeErr(err) {
 }
 
 /**
+ * Fetch only configured CoinPaprika ticker IDs instead of the full /tickers
+ * catalog. The catalog endpoint currently returns 13k+ records; seeders only
+ * need a small mapped subset, so per-ID reads avoid Edge/cron memory and
+ * latency spikes while preserving the same ticker shape.
+ *
+ * @param {string[]} paprikaIds CoinPaprika ids, e.g. btc-bitcoin
+ * @param {{ fetchFn?: typeof fetch, headers?: Record<string, string>, timeoutMs?: number }} [options]
+ * @returns {Promise<object[]>}
+ */
+export async function fetchCoinPaprikaTickersById(paprikaIds, options = {}) {
+  const ids = [...new Set(paprikaIds.filter(Boolean))];
+  if (ids.length === 0) return [];
+
+  const fetchFn = options.fetchFn || fetch;
+  const headers = { Accept: 'application/json', 'User-Agent': CHROME_UA, ...(options.headers || {}) };
+  const timeoutMs = options.timeoutMs || 15_000;
+  const concurrency = Math.max(1, Math.min(Number(options.concurrency || 4), ids.length));
+
+  const results = await allSettledWithConcurrency(ids, concurrency, async (id) => {
+    const resp = await fetchFn(`https://api.coinpaprika.com/v1/tickers/${encodeURIComponent(id)}?quotes=USD`, {
+      headers,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!resp.ok) throw new Error(`CoinPaprika ${id} HTTP ${resp.status}`);
+    return resp.json();
+  });
+
+  const tickers = [];
+  const failures = [];
+  for (let i = 0; i < results.length; i += 1) {
+    const result = results[i];
+    if (result.status === 'fulfilled') {
+      tickers.push(result.value);
+    } else {
+      failures.push(result.reason);
+      console.warn(`[CoinPaprika] Skipping ${ids[i]}: ${describeErr(result.reason)}`);
+    }
+  }
+
+  if (tickers.length === 0 && failures.length > 0) {
+    throw new Error(`All ${failures.length} CoinPaprika ticker request(s) failed`);
+  }
+
+  return tickers;
+}
+
+async function allSettledWithConcurrency(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, items.length);
+
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      try {
+        results[index] = { status: 'fulfilled', value: await mapper(items[index], index) };
+      } catch (reason) {
+        results[index] = { status: 'rejected', reason };
+      }
+    }
+  }));
+
+  return results;
+}
+
+/**
  * Return the bundle-run start timestamp injected by `_bundle-runner.mjs`
  * as the `BUNDLE_RUN_STARTED_AT_MS` env var, or `null` when the seeder
  * is running STANDALONE (manual invocation outside the bundle).
@@ -73,7 +140,7 @@ export function getBundleRunStartedAtMs() {
 // Single source of truth shared by seed-bigmac, seed-grocery-basket, seed-fx-rates.
 // EGP: 0.0192 is the most recently observed live rate (2026-03-21 seed run).
 export const SHARED_FX_FALLBACKS = {
-  USD: 1.0000, GBP: 1.2700, EUR: 1.0850, JPY: 0.0067, CHF: 1.1300,
+  USD: 1, GBP: 1.2700, EUR: 1.0850, JPY: 0.0067, CHF: 1.1300,
   CNY: 0.1380, INR: 0.0120, AUD: 0.6500, CAD: 0.7400, NZD: 0.5900,
   BRL: 0.1900, MXN: 0.0490, ZAR: 0.0540, TRY: 0.0290, KRW: 0.0007,
   SGD: 0.7400, HKD: 0.1280, TWD: 0.0310, THB: 0.0280, IDR: 0.000063,
@@ -393,6 +460,11 @@ export async function readCanonicalEnvelopeMeta(canonicalKey) {
 // fetches like seed-imf-* WEO bundles).
 export const PERMANENT_4XX_STATUSES = new Set([400, 401, 403, 404, 410, 422, 451]);
 
+// sysexits.h EX_TEMPFAIL: fetch failed, last-good TTL was extended, and the
+// bundle runner should retry/report non-OK without treating the seeder as a
+// generic crash.
+export const GRACEFUL_FETCH_FAILURE_EXIT_CODE = 75;
+
 // Cap upstream Retry-After hints so a stuck/abusive header can't park the
 // bundle past its section timeoutMs. Mirrors _yahoo-fetch.mjs convention.
 const MAX_RETRY_AFTER_MS = 60_000;
@@ -441,6 +513,64 @@ export async function withRetry(fn, maxRetries = 3, delayMs = 1000) {
     }
   }
   throw lastErr;
+}
+
+/**
+ * Read a header from either a fetch `Headers` instance or a plain object
+ * (test transports commonly pass `{ 'retry-after': '2' }`). Case-insensitive.
+ */
+export function getResponseHeader(headers, name) {
+  if (!headers) return null;
+  if (typeof headers.get === 'function') return headers.get(name);
+  const lowerName = name.toLowerCase();
+  const foundKey = Object.keys(headers).find((key) => key.toLowerCase() === lowerName);
+  return foundKey ? headers[foundKey] : null;
+}
+
+/** 408 / 429 / 5xx are transient; every other status is a permanent client error. */
+export function isRetryableHttpStatus(status) {
+  return status === 408 || status === 429 || (typeof status === 'number' && status >= 500 && status <= 599);
+}
+
+/**
+ * Build an Error from a non-ok provider response for use with `withRetry`.
+ * Tags `nonRetryable` for permanent statuses and attaches a capped
+ * `retryAfterMs` hint when the server sent one:
+ *   - `maxRetryAfterMs` caps a generous server hint (e.g. a 10s ceiling).
+ *   - `capMs` (the caller's remaining wall-clock budget) caps it further and,
+ *     when <= 0, marks the error non-retryable so the loop stops instead of
+ *     sleeping past its deadline.
+ */
+export function httpRetryError(resp, { maxRetryAfterMs, capMs } = {}) {
+  const status = resp?.status;
+  const err = new Error(`HTTP ${status}`);
+  err.status = status;
+  err.nonRetryable = !isRetryableHttpStatus(status);
+  let retryAfterMs = parseRetryAfterMs(getResponseHeader(resp?.headers, 'Retry-After'));
+  if (retryAfterMs != null) {
+    if (Number.isFinite(maxRetryAfterMs)) retryAfterMs = Math.min(retryAfterMs, maxRetryAfterMs);
+    if (Number.isFinite(capMs)) retryAfterMs = Math.min(retryAfterMs, Math.max(0, capMs));
+    if (retryAfterMs > 0) err.retryAfterMs = retryAfterMs;
+    else err.nonRetryable = true;
+  }
+  return err;
+}
+
+/**
+ * Sentinel error for "the LLM call's time budget is spent". `nonRetryable`
+ * stops `withRetry` immediately; `llmBudgetExhausted` lets the provider loop
+ * distinguish a budget stop (give up, ship degraded) from a provider error
+ * (fall through to the next provider).
+ */
+export function createLlmBudgetError(message = 'llm time budget exhausted') {
+  const err = new Error(message);
+  err.nonRetryable = true;
+  err.llmBudgetExhausted = true;
+  return err;
+}
+
+export function isLlmBudgetError(err) {
+  return Boolean(err?.llmBudgetExhausted);
 }
 
 export function logSeedResult(domain, count, durationMs, extra = {}) {
@@ -605,19 +735,30 @@ export async function httpsProxyFetchRaw(url, proxyAuth, { accept = '*/*', timeo
   return { buffer: result.buffer, contentType: result.contentType };
 }
 
+// Whether a proxy error should be retried (the Decodo proxy rotates exit IP per
+// attempt). Covers 5xx/522, DNS/socket errors, AND mid-handshake TLS tears — the
+// last group is load-bearing: if a TLS-tear isn't classified transient, the
+// retry loop breaks on attempt 1 and falls to a direct FRED fetch, which a
+// datacenter IP gets rate-limited/blocked on → the whole batch fails. Exported
+// for unit testing (the proxy fetch itself is network-bound and not injectable).
+export function isTransientProxyError(message) {
+  return /HTTP 5\d{2}|522|timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|EPIPE|socket (disconnected|hang up)|TLS connection|tls_get_more_records|packet length too long|SSL routines|secure TLS connection/i.test(message || '');
+}
+
 // Fetch JSON from a FRED URL, routing through proxy when available.
 // Proxy-first: FRED consistently blocks/throttles Railway datacenter IPs,
 // so try proxy first to avoid 20s timeout on every direct attempt.
 export async function fredFetchJson(url, proxyAuth) {
   if (proxyAuth) {
-    // Decodo proxy flaps on 5xx/522 — retry up to 3 times with backoff before falling back direct.
+    // Retry the proxy (rotates exit IP per attempt) before falling back direct.
+    // isTransientProxyError covers TLS-handshake tears — see its doc comment.
     let lastProxyErr;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         return await httpsProxyFetchJson(url, proxyAuth);
       } catch (proxyErr) {
         lastProxyErr = proxyErr;
-        const transient = /HTTP 5\d{2}|522|timeout|ECONNRESET|ETIMEDOUT|EAI_AGAIN/i.test(proxyErr.message || '');
+        const transient = isTransientProxyError(proxyErr.message);
         if (attempt < 3 && transient) {
           await new Promise((r) => setTimeout(r, 400 * attempt + Math.random() * 300));
           continue;
@@ -1045,6 +1186,18 @@ export function parseYahooChart(data, symbol) {
   return { symbol, name: symbol, display: symbol, price, change: +change.toFixed(2), sparkline };
 }
 
+/**
+ * Decide whether an extra-key write should be skipped to preserve last-good
+ * cached data. Opt-in per extra-key via `skipWhenEmpty: true` — when set and the
+ * resolved recordCount is 0, runSeed skips the write (and extends the key's TTL)
+ * instead of clobbering a good cached payload with an empty recordCount=0 one on
+ * a partial upstream fetch. The canonical key is already guarded by validateFn;
+ * this closes the same gap for extra keys. Pure function — extracted for tests.
+ */
+export function shouldSkipEmptyExtraKey(ek, recordCount) {
+  return Boolean(ek && ek.skipWhenEmpty) && recordCount === 0;
+}
+
 export async function runSeed(domain, resource, canonicalKey, fetchFn, opts = {}) {
   const {
     validateFn,
@@ -1166,8 +1319,8 @@ export async function runSeed(domain, resource, canonicalKey, fetchFn, opts = {}
     // releases at most once for a given runId, and EXPIRE pipelines on
     // existing keys are safely re-runnable — so a race between the
     // catch path and the handler converges on the correct end state.
-    // process.exit(0) below terminates before any pending SIGTERM can
-    // fire on the success path of cleanup.
+    // process.exit below terminates before any pending SIGTERM can fire
+    // on the success path of cleanup.
     await releaseLock(`${domain}:${resource}`, runId);
     const durationMs = Date.now() - startMs;
     const cause = err.cause ? ` (cause: ${err.cause.message || err.cause.code || err.cause})` : '';
@@ -1179,7 +1332,7 @@ export async function runSeed(domain, resource, canonicalKey, fetchFn, opts = {}
     await extendExistingTtl(keys, ttl);
 
     console.log(`\n=== Failed gracefully (${Math.round(durationMs)}ms) ===`);
-    process.exit(0);
+    process.exit(GRACEFUL_FETCH_FAILURE_EXIT_CODE);
   }
   // Transition to publish phase — handler stays installed but switches
   // behavior via the phase tracker.
@@ -1355,6 +1508,12 @@ export async function runSeed(domain, resource, canonicalKey, fetchFn, opts = {}
     // the canonical one.
     if (extraKeys) {
       for (const ek of extraKeys) {
+        // skipWhenEmpty needs a resolved recordCount, which only exists in
+        // contract mode (declareRecords). Warn loudly on misconfig instead of
+        // silently writing the empty payload the flag was meant to guard against.
+        if (ek.skipWhenEmpty && !contractMode) {
+          console.warn(`  [extraKey] ${ek.key} declares skipWhenEmpty but ${domain}:${resource} is not in contract mode (no declareRecords) — guard inactive`);
+        }
         const ekData = ek.transform ? ek.transform(data) : data;
         let ekEnvelope = null;
         if (contractMode) {
@@ -1366,6 +1525,15 @@ export async function runSeed(domain, resource, canonicalKey, fetchFn, opts = {}
             await releaseLock(`${domain}:${resource}`, runId);
             console.error(`  CONTRACT VIOLATION on extraKey ${ek.key}: ${err.message || err}`);
             process.exit(1);
+          }
+          // Opt-in skip-empty: don't overwrite a good cached extra-key payload
+          // with a recordCount=0 write on a partial fetch (e.g. a token panel
+          // whose IDs the upstream dropped this cycle). Preserve last-good by
+          // extending the existing key's TTL instead.
+          if (shouldSkipEmptyExtraKey(ek, ekCount)) {
+            await extendExistingTtl([ek.key], ek.ttl || ttlSeconds || 600);
+            console.log(`  [extraKey] ${ek.key} empty (recordCount=0) — skipped write, extended TTL to preserve last-good`);
+            continue;
           }
           ekEnvelope = {
             fetchedAt: envelopeMeta.fetchedAt,

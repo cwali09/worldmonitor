@@ -1,6 +1,8 @@
 import { subscribeAuthState, type AuthSession } from '@/services/auth-state';
 import { mountUserButton, openSignIn, openSignUp } from '@/services/clerk';
 import { t } from '@/services/i18n';
+import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+
 
 export class AuthHeaderWidget {
   private container: HTMLElement;
@@ -17,7 +19,7 @@ export class AuthHeaderWidget {
 
     this.unsubscribeAuth = subscribeAuthState((state: AuthSession) => {
       if (state.isPending) {
-        this.container.innerHTML = '';
+        this.renderPending();
         return;
       }
       this.render(state);
@@ -40,13 +42,33 @@ export class AuthHeaderWidget {
   private render(state: AuthSession): void {
     this.unmountUserButton?.();
     this.unmountUserButton = null;
-    this.container.innerHTML = '';
+    this.container.classList.remove('auth-header-widget-pending');
+    this.container.removeAttribute('aria-busy');
+    setTrustedHtml(this.container, trustedHtml('', "legacy direct innerHTML migration"));
 
     if (!state.user) {
       this.renderSignedOut();
       return;
     }
     this.renderSignedIn();
+  }
+
+  private renderPending(): void {
+    this.unmountUserButton?.();
+    this.unmountUserButton = null;
+    this.container.classList.add('auth-header-widget-pending');
+    this.container.setAttribute('aria-busy', 'true');
+    setTrustedHtml(this.container, trustedHtml('', "legacy direct innerHTML migration"));
+
+    const signInSkeleton = document.createElement('span');
+    signInSkeleton.className = 'auth-header-skeleton auth-header-skeleton-signin';
+    signInSkeleton.setAttribute('aria-hidden', 'true');
+    this.container.appendChild(signInSkeleton);
+
+    const signUpSkeleton = document.createElement('span');
+    signUpSkeleton.className = 'auth-header-skeleton auth-header-skeleton-signup';
+    signUpSkeleton.setAttribute('aria-hidden', 'true');
+    this.container.appendChild(signUpSkeleton);
   }
 
   private renderSignedOut(): void {
@@ -78,7 +100,7 @@ export class AuthHeaderWidget {
       settingsBtn.type = 'button';
       settingsBtn.setAttribute('aria-label', t('auth.settings'));
       settingsBtn.title = t('auth.settings');
-      settingsBtn.innerHTML = SETTINGS_ICON;
+      setTrustedHtml(settingsBtn, trustedHtml(SETTINGS_ICON, "legacy direct innerHTML migration"));
       settingsBtn.addEventListener('click', () => this.onSettingsClick?.());
       this.container.appendChild(settingsBtn);
     }

@@ -1,8 +1,10 @@
 import type { AppContext, AppModule } from '@/app/app-context';
+import { applyAgentBusAction } from '@/app/agent-bus-applier';
 import { normalizeExclusiveChoropleths } from '@/components/resilience-choropleth-utils';
 import { replayPendingCalls, clearAllPendingCalls } from '@/app/pending-panel-data';
 import { getAlertsNearLocation } from '@/services/geo-convergence';
-import type { ClusteredEvent } from '@/types';
+import { effectivePubDateMs } from '@/services/feed-date';
+import type { ClusteredEvent, MapLayers, PanelConfig } from '@/types';
 import type { RelatedAsset } from '@/types';
 import type { TheaterPostureSummary } from '@/services/military-surge';
 import {
@@ -39,6 +41,7 @@ import {
   InternetDisruptionsPanel,
   RuntimeConfigPanel,
   InsightsPanel,
+  ThreatTimelinePanel,
   MacroSignalsPanel,
   FearGreedPanel,
   MarketBreadthPanel,
@@ -84,10 +87,11 @@ import {
   WsbTickerScannerPanel,
   AAIISentimentPanel,
   EnergyCrisisPanel,
+  MobilePanelNav,
 } from '@/components';
 import { SatelliteFiresPanel } from '@/components/SatelliteFiresPanel';
 import { focusInvestmentOnMap } from '@/services/investments-focus';
-import { debounce, saveToStorage, loadFromStorage } from '@/utils';
+import { debounce, saveToStorage } from '@/utils';
 import { escapeHtml } from '@/utils/sanitize';
 import {
   FEEDS,
@@ -98,15 +102,19 @@ import {
   ALL_PANELS,
   VARIANT_DEFAULTS,
   isPanelInVariantDefaults,
+  getEffectivePanelConfig,
+  isPanelEntitled,
+  enforceFreePanelLimit,
 } from '@/config';
 import { resolveNewsCategories, enabledNewsCategoryKeys } from '@/config/feed-resolution';
 import { BETA_MODE } from '@/config/beta';
 import { t } from '@/services/i18n';
 import { getCurrentTheme } from '@/utils';
 import { trackCriticalBannerAction } from '@/services/analytics';
+import { getStoredMapModePreference } from '@/services/map-mode-preference';
 import { CustomWidgetPanel } from '@/components/CustomWidgetPanel';
 import { openWidgetChatModal } from '@/components/WidgetChatModal';
-import { loadWidgets, saveWidget } from '@/services/widget-store';
+import { loadWidgets, saveWidget, isProUser } from '@/services/widget-store';
 import type { CustomWidgetSpec } from '@/services/widget-store';
 import { initEntitlementSubscription, destroyEntitlementSubscription, isEntitled, hasTier, getEntitlementState, onEntitlementChange, shouldReloadOnEntitlementChange } from '@/services/entitlements';
 import { initSubscriptionWatch, destroySubscriptionWatch } from '@/services/billing';
@@ -116,12 +124,23 @@ import { initCheckoutOverlay, destroyCheckoutOverlay, showCheckoutSuccess, consu
 import { showCheckoutFailureBanner } from '@/components/checkout-failure-banner';
 import { McpDataPanel } from '@/components/McpDataPanel';
 import { openMcpConnectModal } from '@/components/McpConnectModal';
+import { PanelTabBar } from '@/components/PanelTabBar';
+import {
+  loadTabsState,
+  saveTabsState,
+  generateTabId,
+  buildDefaultTabPanels,
+} from '@/services/tab-store';
+import type { PanelTab, TabsState } from '@/services/tab-store';
+import { showToast } from '@/utils';
 import { loadMcpPanels, saveMcpPanel } from '@/services/mcp-store';
 import type { McpPanelSpec } from '@/services/mcp-store';
 import { getAuthState, subscribeAuthState } from '@/services/auth-state';
 import type { AuthSession } from '@/services/auth-state';
 import { PanelGateReason, getPanelGateReason, hasPremiumAccess } from '@/services/panel-gating';
 import type { Panel } from '@/components/Panel';
+import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+
 
 /**
  * Panels that require premium access on web. Auth-based gating applies to
@@ -176,6 +195,7 @@ export interface PanelLayoutManagerCallbacks {
   loadAllData: () => Promise<void>;
   updateMonitorResults: () => void;
   loadSecurityAdvisories?: () => Promise<void>;
+  applyMapLayerChange?: (layer: keyof MapLayers, enabled: boolean, source: 'programmatic') => void;
 }
 
 export class PanelLayoutManager implements AppModule {
@@ -185,6 +205,10 @@ export class PanelLayoutManager implements AppModule {
   private resolvedPanelOrder: string[] = [];
   private bottomSetMemory: Set<string> = new Set();
   private criticalBannerEl: HTMLElement | null = null;
+  private mobilePanelNav: MobilePanelNav | null = null;
+  private mobileMapCollapseBtn: HTMLButtonElement | null = null;
+  private panelTabBar: PanelTabBar | null = null;
+  private tabsState: TabsState | null = null;
   private aviationCommandBar: AviationCommandBar | null = null;
   private readonly applyTimeRangeFilterDebounced: (() => void) & { cancel(): void };
   private unsubscribeAuth: (() => void) | null = null;
@@ -193,6 +217,7 @@ export class PanelLayoutManager implements AppModule {
   private boundWidgetCreatorHandler: ((e: Event) => void) | null = null;
   private unsubscribeEntitlementChange: (() => void) | null = null;
   private unsubscribePaymentFailureBanner: (() => void) | null = null;
+  private scheduledLoadAllRaf: number | null = null;
 
   constructor(ctx: AppContext, callbacks: PanelLayoutManagerCallbacks) {
     this.ctx = ctx;
@@ -333,7 +358,6 @@ export class PanelLayoutManager implements AppModule {
     this.unsubscribeAuth = subscribeAuthState((state) => {
       this.updatePanelGating(state);
     });
-    this.fetchGitHubStars();
 
     // Handle analyst action chip "Create chart widget →" click
     this.boundWidgetCreatorHandler = ((e: CustomEvent<{ initialMessage?: string }>) => {
@@ -362,10 +386,19 @@ export class PanelLayoutManager implements AppModule {
     }
     this.panelDragCleanupHandlers.forEach((cleanup) => cleanup());
     this.panelDragCleanupHandlers = [];
+    if (this.scheduledLoadAllRaf !== null) {
+      cancelAnimationFrame(this.scheduledLoadAllRaf);
+      this.scheduledLoadAllRaf = null;
+    }
     if (this.criticalBannerEl) {
       this.criticalBannerEl.remove();
       this.criticalBannerEl = null;
     }
+    this.mobilePanelNav?.destroy();
+    this.mobilePanelNav = null;
+    this.mobileMapCollapseBtn = null;
+    this.panelTabBar?.destroy();
+    this.panelTabBar = null;
     // Clean up happy variant panels
     this.ctx.tvMode?.destroy();
     this.ctx.tvMode = null;
@@ -456,24 +489,10 @@ export class PanelLayoutManager implements AppModule {
     }
   }
 
-  private async fetchGitHubStars(): Promise<void> {
-    try {
-      const response = await fetch('https://api.github.com/repos/koala73/worldmonitor');
-      if (!response.ok) return;
-      const data = await response.json();
-      const starsEl = document.getElementById('githubStars');
-      if (starsEl) {
-        const count = data.stargazers_count;
-        const k = Math.round(count / 1000);
-        starsEl.textContent = `${k}k`;
-      }
-    } catch (e) {
-      // ignore errors
-    }
-  }
-
   async renderLayout(): Promise<void> {
-    this.ctx.container.innerHTML = `
+    const isGlobeMode = getStoredMapModePreference() === 'globe';
+
+    setTrustedHtml(this.ctx.container, trustedHtml(`
       ${this.ctx.isDesktopApp ? '<div class="tauri-titlebar" data-tauri-drag-region></div>' : ''}
       <div class="header">
         <div class="header-left">
@@ -486,7 +505,7 @@ export class PanelLayoutManager implements AppModule {
         const vHref = (v: string, prod: string) => local || SITE_VARIANT === v ? '#' : prod;
         const vTarget = (v: string) => !local && SITE_VARIANT !== v && inIframe ? 'target="_blank" rel="noopener"' : '';
         return `
-            <a href="${vHref('full', 'https://worldmonitor.app')}"
+            <a href="${vHref('full', 'https://worldmonitor.app/dashboard')}"
                class="variant-option ${SITE_VARIANT === 'full' ? 'active' : ''}"
                data-variant="full"
                ${vTarget('full')}
@@ -547,7 +566,6 @@ export class PanelLayoutManager implements AppModule {
           </a>
           <a href="https://github.com/koala73/worldmonitor" target="_blank" rel="noopener" class="github-link" title="${t('header.viewOnGitHub')}">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-            <span class="github-stars" id="githubStars"></span>
           </a>
           <button class="mobile-settings-btn" id="mobileSettingsBtn" title="${t('header.settings')}">
             <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -568,6 +586,7 @@ export class PanelLayoutManager implements AppModule {
               <option value="oceania">${t('components.deckgl.views.oceania')}</option>
             </select>
           </div>
+          <span id="missionPresetMount" class="mission-preset-mount"></span>
           <button class="mobile-search-btn" id="mobileSearchBtn" aria-label="${t('header.search')}">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
           </button>
@@ -575,10 +594,11 @@ export class PanelLayoutManager implements AppModule {
         <div class="header-right">
           <button class="search-btn" id="searchBtn"><kbd>⌘K</kbd> ${t('header.search')}</button>
           ${this.ctx.isDesktopApp ? '' : `<button class="copy-link-btn" id="copyLinkBtn">${t('header.copyLink')}</button>`}
+          ${this.ctx.isDesktopApp ? '' : `<button class="copy-link-btn embed-link-btn" id="embedLinkBtn">${t('header.embed')}</button>`}
           ${this.ctx.isDesktopApp ? '' : `<button class="fullscreen-btn" id="fullscreenBtn" title="${t('header.fullscreen')}">⛶</button>`}
           ${SITE_VARIANT === 'happy' ? `<button class="tv-mode-btn" id="tvModeBtn" title="TV Mode (Shift+T)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></button>` : ''}
           <span id="unifiedSettingsMount"></span>
-          <span id="authWidgetMount"></span>
+          <span id="authWidgetMount" class="auth-widget-mount"></span>
         </div>
       </div>
       <div class="mobile-menu-overlay" id="mobileMenuOverlay"></div>
@@ -611,6 +631,11 @@ export class PanelLayoutManager implements AppModule {
         <button class="mobile-menu-item" id="mobileMenuRegion">
           <span class="mobile-menu-item-icon">🌐</span>
           <span class="mobile-menu-item-label">${t('components.deckgl.views.global')}</span>
+          <span class="mobile-menu-chevron">▸</span>
+        </button>
+        <button class="mobile-menu-item" id="mobileMenuMission">
+          <span class="mobile-menu-item-icon">◎</span>
+          <span class="mobile-menu-item-label">Mission</span>
           <span class="mobile-menu-chevron">▸</span>
         </button>
         <div class="mobile-menu-divider"></div>
@@ -655,6 +680,7 @@ export class PanelLayoutManager implements AppModule {
         </button>`
       ).join('')}
       </div>
+      <div class="dashboard-tabs-mount" id="panelTabsMount"></div>
       <div class="main-content${this.ctx.isDesktopApp ? ' desktop-grid' : ''}">
         <div class="map-section" id="mapSection">
           <div class="panel-header">
@@ -664,8 +690,8 @@ export class PanelLayoutManager implements AppModule {
             <span class="header-clock" id="headerClock" translate="no"></span>
             <div class="map-header-actions">
               <div class="map-dimension-toggle" id="mapDimensionToggle">
-                <button class="map-dim-btn${loadFromStorage<string>(STORAGE_KEYS.mapMode, 'flat') === 'globe' ? '' : ' active'}" data-mode="flat" title="2D Map">2D</button>
-                <button class="map-dim-btn${loadFromStorage<string>(STORAGE_KEYS.mapMode, 'flat') === 'globe' ? ' active' : ''}" data-mode="globe" title="3D Globe">3D</button>
+                <button class="map-dim-btn${isGlobeMode ? '' : ' active'}" data-mode="flat" title="2D Map">2D</button>
+                <button class="map-dim-btn${isGlobeMode ? ' active' : ''}" data-mode="globe" title="3D Globe">3D</button>
               </div>
               <button class="map-pin-btn" id="mapFullscreenBtn" title="Fullscreen">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
@@ -683,7 +709,7 @@ export class PanelLayoutManager implements AppModule {
           <div class="map-bottom-grid" id="mapBottomGrid"></div>
         </div>
         <div class="map-width-resize-handle" id="mapWidthResizeHandle"></div>
-        <div class="panels-grid" id="panelsGrid"></div>
+        <div class="panels-grid" id="panelsGrid" role="tabpanel"></div>
         <button class="search-mobile-fab" id="searchMobileFab" aria-label="Search">\u{1F50D}</button>
       </div>
       <footer class="site-footer">
@@ -706,13 +732,222 @@ export class PanelLayoutManager implements AppModule {
         </nav>
         <span class="site-footer-copy">&copy; ${new Date().getFullYear()} World Monitor</span>
       </footer>
-    `;
+    `, "legacy direct innerHTML migration"));
 
     await this.createPanels();
 
+    this.initPanelTabs();
+
     if (this.ctx.isMobile) {
       this.setupMobileMapToggle();
+      this.setupMobilePanelNav();
     }
+  }
+
+  // ============================================
+  // Dashboard tabs — named, persistent panel workspaces
+  // ============================================
+
+  private initPanelTabs(): void {
+    const mount = document.getElementById('panelTabsMount');
+    if (!mount) return;
+
+    let state = loadTabsState();
+    if (!state) {
+      // First run — wrap the user's current layout in an initial tab so
+      // nothing changes visually until they create a second tab.
+      const initial: PanelTab = {
+        id: generateTabId(),
+        name: t('dashboardTabs.defaultName'),
+        ...this.captureCurrentTabState(),
+      };
+      state = { activeTabId: initial.id, tabs: [initial] };
+      saveTabsState(state);
+    } else {
+      // Clamp stored snapshots to the current free-tier cap so a workspace
+      // saved while Pro (or persisted before the cap existed) can't re-enable
+      // an over-cap layout when the user later switches to it. applyTabPanelState
+      // re-clamps on apply too; this keeps the persisted store self-healing.
+      const pro = isProUser();
+      let healedSnapshots = false;
+      for (const tab of state.tabs) {
+        const clamped = enforceFreePanelLimit(tab.panelSettings, pro);
+        if (this.panelSettingsEnabledStateChanged(tab.panelSettings, clamped)) {
+          healedSnapshots = true;
+        }
+        tab.panelSettings = clamped;
+      }
+      if (healedSnapshots) saveTabsState(state);
+    }
+    this.tabsState = state;
+
+    this.panelTabBar = new PanelTabBar(() => this.tabsState!, {
+      onSelect: (id) => this.switchToTab(id),
+      onAdd: () => this.addTab(),
+      onRename: (id, name) => this.renameTab(id, name),
+      onDelete: (id) => this.deleteTab(id),
+    });
+    mount.appendChild(this.panelTabBar.getElement());
+  }
+
+  private panelSettingsEnabledStateChanged(
+    before: Record<string, PanelConfig>,
+    after: Record<string, PanelConfig>,
+  ): boolean {
+    const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+    for (const key of keys) {
+      if (before[key]?.enabled !== after[key]?.enabled) return true;
+    }
+    return false;
+  }
+
+  /** Capture the live panel state (settings + order) for a tab snapshot. */
+  private captureCurrentTabState(): Pick<PanelTab, 'panelSettings' | 'panelOrder' | 'bottomSet'> {
+    // Persist the live DOM order first so the snapshot reflects any drags.
+    this.savePanelOrder();
+    return {
+      panelSettings: JSON.parse(JSON.stringify(this.ctx.panelSettings)) as Record<string, PanelConfig>,
+      panelOrder: [...this.resolvedPanelOrder],
+      bottomSet: Array.from(this.bottomSetMemory),
+    };
+  }
+
+  /** Refresh the active tab's snapshot from live state (called on switch-away). */
+  private snapshotActiveTab(): void {
+    if (!this.tabsState) return;
+    const active = this.tabsState.tabs.find((t) => t.id === this.tabsState!.activeTabId);
+    if (!active) return;
+    Object.assign(active, this.captureCurrentTabState());
+  }
+
+  private switchToTab(tabId: string): void {
+    if (!this.tabsState || tabId === this.tabsState.activeTabId) return;
+    const target = this.tabsState.tabs.find((t) => t.id === tabId);
+    if (!target) return;
+
+    this.snapshotActiveTab();
+    this.tabsState.activeTabId = tabId;
+    saveTabsState(this.tabsState);
+
+    this.applyTabPanelState(target.panelSettings, target.panelOrder, target.bottomSet);
+    this.panelTabBar?.refresh();
+  }
+
+  private addTab(): void {
+    if (!this.tabsState) return;
+    this.snapshotActiveTab();
+
+    const defaults = buildDefaultTabPanels(this.ctx.panelSettings);
+    // The variant default set can exceed FREE_MAX_PANELS (e.g. 81 panels in the
+    // full variant); clamp it to the free-tier cap so a new tab can't bypass
+    // the limit that settings/search/boot all enforce.
+    const tab: PanelTab = {
+      id: generateTabId(),
+      name: t('dashboardTabs.newTabName'),
+      panelSettings: enforceFreePanelLimit(defaults.panelSettings, isProUser()),
+      panelOrder: defaults.panelOrder,
+      bottomSet: [],
+    };
+    this.tabsState.tabs.push(tab);
+    this.tabsState.activeTabId = tab.id;
+    saveTabsState(this.tabsState);
+
+    this.applyTabPanelState(tab.panelSettings, tab.panelOrder, tab.bottomSet);
+    this.panelTabBar?.refresh();
+    showToast(t('dashboardTabs.newTabCreated'));
+  }
+
+  private renameTab(tabId: string, name: string): void {
+    if (!this.tabsState) return;
+    const tab = this.tabsState.tabs.find((t) => t.id === tabId);
+    if (!tab) return;
+    tab.name = name;
+    saveTabsState(this.tabsState);
+    this.panelTabBar?.refresh();
+  }
+
+  private deleteTab(tabId: string): void {
+    if (!this.tabsState || this.tabsState.tabs.length <= 1) return;
+    const idx = this.tabsState.tabs.findIndex((t) => t.id === tabId);
+    if (idx === -1) return;
+    const wasActive = this.tabsState.activeTabId === tabId;
+    const [removed] = this.tabsState.tabs.splice(idx, 1);
+
+    if (wasActive) {
+      const fallback = this.tabsState.tabs[Math.max(0, idx - 1)]!;
+      this.tabsState.activeTabId = fallback.id;
+      saveTabsState(this.tabsState);
+      this.applyTabPanelState(fallback.panelSettings, fallback.panelOrder, fallback.bottomSet);
+    } else {
+      saveTabsState(this.tabsState);
+    }
+    this.panelTabBar?.refresh();
+    showToast(t('dashboardTabs.tabDeleted', { name: removed!.name }));
+  }
+
+  /**
+   * Load a tab's panel snapshot into the live global state and re-apply
+   * the layout. Mirrors the mission-preset apply pipeline (panels only —
+   * map layers, view, and time range stay global across tabs).
+   */
+  private applyTabPanelState(
+    panelSettings: Record<string, PanelConfig>,
+    panelOrder: string[],
+    bottomSet: string[],
+  ): void {
+    const isDynamicPanel = (k: string) =>
+      !ALL_PANELS[k] && (k === 'runtime-config' || k.startsWith('cw-') || k.startsWith('mcp-'));
+
+    const next: Record<string, PanelConfig> = {};
+    for (const [key, config] of Object.entries(panelSettings)) {
+      next[key] = { ...config };
+    }
+    // Carry over panels missing from the snapshot: dynamic panels (custom
+    // widgets / MCP / desktop config created after the snapshot) keep their
+    // current config so they don't get orphaned visible-but-untracked;
+    // panels added to the app since the snapshot seed from variant defaults
+    // (same formula as the App.ts settings merge).
+    for (const [key, config] of Object.entries(this.ctx.panelSettings)) {
+      if (next[key]) continue;
+      if (isDynamicPanel(key)) {
+        next[key] = { ...config };
+      } else {
+        const effective = getEffectivePanelConfig(key, SITE_VARIANT);
+        next[key] = { ...effective, enabled: isPanelInVariantDefaults(key) && effective.enabled };
+      }
+    }
+
+    // Final free-tier guarantee: this is the only path that writes a tab's
+    // panel selection into STORAGE_KEYS.panels, so clamping here means no tab
+    // operation (add / switch / delete-fallback) can ever persist an over-cap
+    // workspace, regardless of how the snapshot was produced.
+    const capped = enforceFreePanelLimit(next, isProUser());
+
+    this.ctx.panelSettings = capped;
+    saveToStorage(STORAGE_KEYS.panels, capped);
+    saveToStorage(this.ctx.PANEL_ORDER_KEY, panelOrder);
+    saveToStorage(this.ctx.PANEL_ORDER_KEY + '-bottom-set', bottomSet);
+
+    this.applyPanelSettings();
+    this.applySavedPanelOrder();
+    this.ctx.unifiedSettings?.refreshPanelToggles();
+    this.mountLiveNewsIfReady();
+    this.scheduleLoadAllData();
+  }
+
+  private setupMobilePanelNav(): void {
+    const grid = document.getElementById('panelsGrid');
+    if (!grid) return;
+    this.mobilePanelNav = new MobilePanelNav(() => this.ctx.panelSettings);
+    grid.before(this.mobilePanelNav.getElement());
+    this.mobilePanelNav.refresh();
+  }
+
+  private updateMobileMapCollapseBtn(isCollapsed: boolean): void {
+    if (!this.mobileMapCollapseBtn) return;
+    this.mobileMapCollapseBtn.textContent = isCollapsed
+      ? `▶ ${t('components.map.showMap')}`
+      : `▼ ${t('components.map.hideMap')}`;
   }
 
   private setupMobileMapToggle(): void {
@@ -724,33 +959,38 @@ export class PanelLayoutManager implements AppModule {
     const collapsed = stored === 'true';
     if (collapsed) mapSection.classList.add('collapsed');
 
-    const updateBtn = (btn: HTMLButtonElement, isCollapsed: boolean) => {
-      btn.textContent = isCollapsed ? `▶ ${t('components.map.showMap')}` : `▼ ${t('components.map.hideMap')}`;
-    };
-
     const btn = document.createElement('button');
     btn.className = 'map-collapse-btn';
-    updateBtn(btn, collapsed);
     headerLeft.after(btn);
+    this.mobileMapCollapseBtn = btn;
+    this.updateMobileMapCollapseBtn(collapsed);
 
     btn.addEventListener('click', () => {
       const isCollapsed = mapSection.classList.toggle('collapsed');
-      updateBtn(btn, isCollapsed);
+      this.updateMobileMapCollapseBtn(isCollapsed);
       localStorage.setItem('mobile-map-collapsed', String(isCollapsed));
       if (!isCollapsed) window.dispatchEvent(new Event('resize'));
     });
   }
 
-  renderCriticalBanner(postures: TheaterPostureSummary[]): void {
-    if (this.ctx.isMobile) {
-      if (this.criticalBannerEl) {
-        this.criticalBannerEl.remove();
-        this.criticalBannerEl = null;
-      }
-      document.body.classList.remove('has-critical-banner');
-      return;
+  /** Expand the mobile map (no-op if already expanded) so a banner's
+   *  "View Region" fly-to is actually visible, then scroll it into view. */
+  private revealMobileMap(): void {
+    const mapSection = document.getElementById('mapSection');
+    if (!mapSection) return;
+    // Map panel disabled in settings — nothing to reveal; scrolling to an
+    // empty top would read as the tap doing nothing.
+    if (mapSection.classList.contains('hidden')) return;
+    if (mapSection.classList.contains('collapsed')) {
+      mapSection.classList.remove('collapsed');
+      localStorage.setItem('mobile-map-collapsed', 'false');
+      this.updateMobileMapCollapseBtn(false);
+      window.dispatchEvent(new Event('resize'));
     }
+    document.querySelector('.main-content')?.scrollTo({ top: 0 });
+  }
 
+  renderCriticalBanner(postures: TheaterPostureSummary[]): void {
     const dismissedAt = sessionStorage.getItem('banner-dismissed');
     if (dismissedAt && Date.now() - parseInt(dismissedAt, 10) < 30 * 60 * 1000) {
       return;
@@ -781,7 +1021,7 @@ export class PanelLayoutManager implements AppModule {
 
     document.body.classList.add('has-critical-banner');
     this.criticalBannerEl.className = `critical-posture-banner ${isCritical ? 'severity-critical' : 'severity-elevated'}`;
-    this.criticalBannerEl.innerHTML = `
+    setTrustedHtml(this.criticalBannerEl, trustedHtml(`
       <div class="banner-content">
         <span class="banner-icon">${isCritical ? '🚨' : '⚠️'}</span>
         <span class="banner-headline">${escapeHtml(top.headline)}</span>
@@ -790,12 +1030,13 @@ export class PanelLayoutManager implements AppModule {
       </div>
       <button class="banner-view" data-lat="${top.centerLat}" data-lon="${top.centerLon}">View Region</button>
       <button class="banner-dismiss">×</button>
-    `;
+    `, "legacy direct innerHTML migration"));
 
     this.criticalBannerEl.querySelector('.banner-view')?.addEventListener('click', () => {
       console.log('[Banner] View Region clicked:', top.theaterId, 'lat:', top.centerLat, 'lon:', top.centerLon);
       trackCriticalBannerAction('view', top.theaterId);
       if (typeof top.centerLat === 'number' && typeof top.centerLon === 'number') {
+        if (this.ctx.isMobile) this.revealMobileMap();
         this.ctx.map?.setCenter(top.centerLat, top.centerLon, 4);
       } else {
         console.error('[Banner] Missing coordinates for', top.theaterId);
@@ -827,6 +1068,7 @@ export class PanelLayoutManager implements AppModule {
       const panel = this.ctx.panels[key];
       panel?.toggle(config.enabled);
     });
+    this.mobilePanelNav?.refresh();
   }
 
   /**
@@ -849,6 +1091,7 @@ export class PanelLayoutManager implements AppModule {
       else grid.appendChild(el);
     }
     this.applyPanelSettings();
+    panel.observeNearViewport(() => this.scheduleLoadAllData(), 200);
   }
 
   private shouldCreatePanel(key: string): boolean {
@@ -896,7 +1139,7 @@ export class PanelLayoutManager implements AppModule {
     const panelsGrid = document.getElementById('panelsGrid')!;
 
     const mapContainer = document.getElementById('mapContainer') as HTMLElement;
-    const preferGlobe = loadFromStorage<string>(STORAGE_KEYS.mapMode, 'flat') === 'globe';
+    const preferGlobe = getStoredMapModePreference() === 'globe';
     // Dynamic import: keeps maplibre-gl + @deck.gl/* + @loaders.gl + @luma.gl
     // out of the entry chunk. Loads in parallel with paint, so the map mounts
     // a beat after the panel grid renders instead of blocking it.
@@ -1207,7 +1450,16 @@ export class PanelLayoutManager implements AppModule {
     // reactively by updatePanelGating() via auth state subscription (all in WEB_PREMIUM_PANELS).
 
     this.lazyPanel('chat-analyst', () =>
-      import('@/components/ChatAnalystPanel').then(m => new m.ChatAnalystPanel()),
+      import('@/components/ChatAnalystPanel').then(m => {
+        const panel = new m.ChatAnalystPanel();
+        panel.setDashboardActionHandler((action) => applyAgentBusAction(this.ctx, action, {
+          getPanelConfig: (panelId) => getEffectivePanelConfig(panelId, SITE_VARIANT),
+          isPanelAllowed: (panelId, config) => isPanelEntitled(panelId, config, hasPremiumAccess(getAuthState())),
+          hasPremiumAccess: () => hasPremiumAccess(getAuthState()),
+          applyLayerChange: this.callbacks.applyMapLayerChange,
+        }));
+        return panel;
+      }),
     );
 
     this.lazyPanel('forecast', () =>
@@ -1355,6 +1607,9 @@ export class PanelLayoutManager implements AppModule {
     }
 
     this.createPanel('insights', () => new InsightsPanel());
+    if (isPanelInVariantDefaults('threat-timeline')) {
+      this.createPanel('threat-timeline', () => new ThreatTimelinePanel());
+    }
 
     // Global Giving panel (all variants)
     this.lazyPanel('giving', () =>
@@ -1648,11 +1903,39 @@ export class PanelLayoutManager implements AppModule {
     this.applyPanelSettings();
     this.applyInitialUrlState();
 
+    // Observe each panel for viewport entry. As soon as a panel scrolls
+    // within ~200px of the viewport it fires loadAllData() once
+    // (debounced via rAF to coalesce above-the-fold panels that all
+    // intersect on the first tick), so below-fold panels get their
+    // viewport-gated data without waiting on the scroll listener.
+    // Bootstrap already ran loadAllData() with forceAll=false, so this
+    // is purely the lazy-scroll trigger. (#3990)
+    this.observePanelsForViewport();
+
     if (import.meta.env.DEV) {
       const configured = new Set(Object.keys(ALL_PANELS).filter(k => k !== 'map'));
       const created = new Set(Object.keys(this.ctx.panels));
       const extra = [...created].filter(k => !configured.has(k) && k !== 'runtime-config' && !k.startsWith('cw-') && !k.startsWith('mcp-'));
       if (extra.length) console.warn('[PanelLayoutManager] Panels created but not in ALL_PANELS:', extra);
+    }
+  }
+
+  private scheduleLoadAllData(): void {
+    if (this.scheduledLoadAllRaf !== null) return;
+    if (typeof window === 'undefined') {
+      void this.callbacks.loadAllData();
+      return;
+    }
+    this.scheduledLoadAllRaf = window.requestAnimationFrame(() => {
+      this.scheduledLoadAllRaf = null;
+      void this.callbacks.loadAllData();
+    });
+  }
+
+  private observePanelsForViewport(): void {
+    for (const panel of Object.values(this.ctx.panels)) {
+      const observable = panel as { observeNearViewport?: (cb: () => void, marginPx?: number) => void };
+      observable.observeNearViewport?.(() => this.scheduleLoadAllData(), 200);
     }
   }
 
@@ -1678,8 +1961,14 @@ export class PanelLayoutManager implements AppModule {
     };
     const cutoff = Date.now() - (ranges[range] ?? Infinity);
     return items.filter((item) => {
-      const ts = item.pubDate instanceof Date ? item.pubDate.getTime() : new Date(item.pubDate).getTime();
-      return Number.isFinite(ts) ? ts >= cutoff : true;
+      // Recency gate routed through effectivePubDateMs so pubDateMissing
+      // items fail the cutoff check rather than falsely claiming freshness.
+      // Items with NaN/Infinity/Invalid Date pubDates are ALSO excluded
+      // (the helper sanitizes them to 0); previous behavior fell through
+      // to `true` on non-finite, which included corrupt-stamp items in
+      // narrow time windows. Treating untrustworthy timestamps uniformly
+      // is the intentional shift — see data-loader.filterItemsByTimeRange.
+      return effectivePubDateMs(item) >= cutoff;
     });
   }
 
@@ -1783,6 +2072,52 @@ export class PanelLayoutManager implements AppModule {
     } catch {
       return [];
     }
+  }
+
+  public applySavedPanelOrder(panelOrder?: string[]): void {
+    const grid = document.getElementById('panelsGrid');
+    const bottomGrid = document.getElementById('mapBottomGrid');
+    if (!grid || !bottomGrid) return;
+
+    const activePanelKeys = Object.keys(this.ctx.panelSettings).filter(k => k !== 'map');
+    const savedOrder = (panelOrder ?? this.getSavedPanelOrder()).filter(k => activePanelKeys.includes(k));
+    if (savedOrder.length === 0) return;
+
+    const seen = new Set<string>();
+    const allOrder: string[] = [];
+    const appendUnique = (key: string) => {
+      if (seen.has(key) || !activePanelKeys.includes(key)) return;
+      seen.add(key);
+      allOrder.push(key);
+    };
+    savedOrder.forEach(appendUnique);
+    this.resolvedPanelOrder.forEach(appendUnique);
+    activePanelKeys.forEach(appendUnique);
+
+    this.bottomSetMemory = panelOrder ? new Set<string>() : this.getSavedBottomSet();
+    this.resolvedPanelOrder = allOrder;
+
+    const effectiveUltraWide = this.getEffectiveUltraWide();
+    this.wasUltraWide = effectiveUltraWide;
+    const sidebarOrder = effectiveUltraWide
+      ? allOrder.filter(k => !this.bottomSetMemory.has(k))
+      : allOrder;
+    const bottomOrder = effectiveUltraWide
+      ? allOrder.filter(k => this.bottomSetMemory.has(k))
+      : [];
+
+    const firstAddBlock = grid.querySelector('.add-panel-block');
+    sidebarOrder.forEach((key) => {
+      const el = this.ctx.panels[key]?.getElement();
+      if (!el) return;
+      if (firstAddBlock) grid.insertBefore(el, firstAddBlock);
+      else grid.appendChild(el);
+    });
+
+    bottomOrder.forEach((key) => {
+      const el = this.ctx.panels[key]?.getElement();
+      if (el) bottomGrid.appendChild(el);
+    });
   }
 
   savePanelOrder(): void {
@@ -2046,12 +2381,21 @@ export class PanelLayoutManager implements AppModule {
       if (savedConfig && !savedConfig.enabled) {
         this.ctx.panels[key]?.hide();
       }
+      // Same late-mount problem for the mobile category filter: the user may
+      // have picked a chip while this import was in flight.
+      this.mobilePanelNav?.applyToNewPanel(el);
     }).catch((err) => {
       console.error(`[panel] failed to lazy-load "${key}"`, err);
     });
   }
 
   private makeDraggable(el: HTMLElement, key: string): void {
+    type DropPosition = {
+      grid: HTMLElement;
+      panel: HTMLElement | null;
+      insertBefore: boolean;
+    };
+
     el.dataset.panel = key;
     let isDragging = false;
     let dragStarted = false;
@@ -2064,6 +2408,7 @@ export class PanelLayoutManager implements AppModule {
     let dragOffsetX = 0;
     let dragOffsetY = 0;
     let originalIndex = -1;
+    let originalRect: DOMRect | null = null;
     let onKeyDown: ((e: KeyboardEvent) => void) | null = null;
     const DRAG_THRESHOLD = 8;
 
@@ -2123,28 +2468,64 @@ export class PanelLayoutManager implements AppModule {
       document.body.appendChild(indicator);
       return indicator;
     };
-    const swapElements = (a: HTMLElement, b: HTMLElement) => {
-      if (a === b) return;
-      const aParent = a.parentElement;
-      const bParent = b.parentElement;
-      if (!aParent || !bParent) return;
 
-      const aNext = a.nextSibling;
-      const bNext = b.nextSibling;
+    const isWithinOriginalRect = (clientX: number, clientY: number) =>
+      !!originalRect &&
+      clientX >= originalRect.left &&
+      clientX <= originalRect.right &&
+      clientY >= originalRect.top &&
+      clientY <= originalRect.bottom;
 
-      if (aParent === bParent) {
-        if (aNext === b) {
-          aParent.insertBefore(b, a);
-        } else if (bNext === a) {
-          aParent.insertBefore(a, b);
+    const getAppendReference = (grid: HTMLElement): ChildNode | null => {
+      if (grid.id !== 'panelsGrid') return null;
+      return grid.querySelector('.add-panel-block');
+    };
+
+    const canAppendToGrid = (grid: HTMLElement, clientY: number): boolean => {
+      if (grid !== originalParent) return true;
+      const panelBottoms = Array.from(grid.children)
+        .filter((child): child is HTMLElement =>
+          child instanceof HTMLElement &&
+          child !== el &&
+          child.classList.contains('panel') &&
+          !child.classList.contains('hidden'),
+        )
+        .map((panel) => panel.getBoundingClientRect().bottom);
+      if (panelBottoms.length === 0) return false;
+      return clientY > Math.max(...panelBottoms);
+    };
+
+    const commitDrop = (dropPos: DropPosition, clientX: number, clientY: number): boolean => {
+      const { grid, panel, insertBefore } = dropPos;
+
+      if (panel) {
+        if (panel === el || panel.parentElement !== grid) return false;
+
+        if (insertBefore) {
+          if (el.nextSibling === panel) return false;
         } else {
-          aParent.insertBefore(b, aNext);
-          aParent.insertBefore(a, bNext);
+          if (panel.nextSibling === el) return false;
         }
-      } else {
-        aParent.insertBefore(b, aNext);
-        bParent.insertBefore(a, bNext);
+
+        const referenceNode = insertBefore ? panel : panel.nextSibling;
+        if (referenceNode && referenceNode.parentNode !== grid) return false;
+
+        grid.insertBefore(el, referenceNode);
+        return true;
       }
+
+      if (grid === originalParent && isWithinOriginalRect(clientX, clientY)) {
+        return false;
+      }
+      if (!canAppendToGrid(grid, clientY)) return false;
+
+      const referenceNode = getAppendReference(grid);
+      if (referenceNode && referenceNode.parentNode !== grid) return false;
+      if (referenceNode === el) return false;
+      if (el.parentElement === grid && el.nextSibling === referenceNode) return false;
+
+      grid.insertBefore(el, referenceNode);
+      return true;
     };
 
     const updateGhostPosition = (clientX: number, clientY: number) => {
@@ -2153,7 +2534,7 @@ export class PanelLayoutManager implements AppModule {
       ghostEl.style.top = (clientY - dragOffsetY) + 'px';
     };
 
-    const findDropPosition = (clientX: number, clientY: number) => {
+    const findDropPosition = (clientX: number, clientY: number): DropPosition | null => {
       const grid = document.getElementById('panelsGrid');
       const bottomGrid = document.getElementById('mapBottomGrid');
       if (!grid || !bottomGrid) return null;
@@ -2173,10 +2554,17 @@ export class PanelLayoutManager implements AppModule {
 
       const currentTargetGrid = targetGrid || (targetPanel ? targetPanel.parentElement as HTMLElement : null);
       if (!currentTargetGrid || (currentTargetGrid !== grid && currentTargetGrid !== bottomGrid)) return null;
+      const panel = targetPanel && targetPanel !== el ? targetPanel : null;
+      let insertBefore = false;
+      if (panel) {
+        const panelRect = panel.getBoundingClientRect();
+        insertBefore = clientY < panelRect.top + panelRect.height / 2;
+      }
 
       return {
         grid: currentTargetGrid,
-        panel: targetPanel && targetPanel !== el ? targetPanel : null,
+        panel,
+        insertBefore,
       };
     };
 
@@ -2193,8 +2581,19 @@ export class PanelLayoutManager implements AppModule {
         return;
       }
 
-      const { grid, panel } = dropPos;
+      const { grid, panel, insertBefore } = dropPos;
       if (!dropIndicator) return;
+
+      const noOpEmptyDrop = !panel &&
+        ((grid === originalParent && isWithinOriginalRect(clientX, clientY)) || !canAppendToGrid(grid, clientY));
+      if (noOpEmptyDrop) {
+        dropIndicator.style.opacity = '0';
+        if (lastTargetPanel) {
+          lastTargetPanel.classList.remove('panel-drop-target');
+          lastTargetPanel = null;
+        }
+        return;
+      }
 
       // highlight hovered panel
       if (panel !== lastTargetPanel) {
@@ -2210,11 +2609,9 @@ export class PanelLayoutManager implements AppModule {
 
       if (panel) {
         const panelRect = panel.getBoundingClientRect();
-        const panelMid = panelRect.top + panelRect.height / 2;
-        const shouldInsertBefore = clientY < panelMid;
         width = panelRect.width;
         left = panelRect.left;
-        top = shouldInsertBefore ? panelRect.top - 4 : panelRect.bottom;
+        top = insertBefore ? panelRect.top - 4 : panelRect.bottom;
       } else {
         // dropping into empty grid: position at grid bottom
         const gridRect = grid.getBoundingClientRect();
@@ -2244,6 +2641,7 @@ export class PanelLayoutManager implements AppModule {
         el.classList.add('dragging-source');
         originalParent = el.parentElement as HTMLElement;
         originalIndex = Array.from(originalParent.children).indexOf(el);
+        originalRect = el.getBoundingClientRect();
         ghostEl = createGhostElement();
         dropIndicator = createDropIndicator();
         onKeyDown = (e: KeyboardEvent) => {
@@ -2281,6 +2679,7 @@ export class PanelLayoutManager implements AppModule {
             onKeyDown = null;
             isDragging = false;
             dragStarted = false;
+            originalRect = null;
             if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
           }
         };
@@ -2309,16 +2708,7 @@ export class PanelLayoutManager implements AppModule {
       if (dragStarted) {
         // Find final drop position using most recent cursor coords
         const dropPos = findDropPosition(lastX, lastY);
-        
-        if (dropPos) {
-          const { grid, panel } = dropPos;
-
-          if (panel && panel !== el) {
-            swapElements(el, panel);
-          } else if (grid !== originalParent) {
-            grid.appendChild(el);
-          }
-        }
+        const moved = dropPos ? commitDrop(dropPos, lastX, lastY) : false;
         
         // Clean up drag visualization
         el.classList.remove('dragging-source');
@@ -2339,16 +2729,18 @@ export class PanelLayoutManager implements AppModule {
           lastTargetPanel = null;
         }
         
-        // Update status
-        const isInBottom = !!el.closest('.map-bottom-grid');
-        if (isInBottom) {
-          this.bottomSetMemory.add(key);
-        } else {
-          this.bottomSetMemory.delete(key);
+        if (moved) {
+          const isInBottom = !!el.closest('.map-bottom-grid');
+          if (isInBottom) {
+            this.bottomSetMemory.add(key);
+          } else {
+            this.bottomSetMemory.delete(key);
+          }
+          this.savePanelOrder();
         }
-        this.savePanelOrder();
       }
       dragStarted = false;
+      originalRect = null;
       if (onKeyDown) {
         document.removeEventListener('keydown', onKeyDown);
         onKeyDown = null;
@@ -2375,6 +2767,7 @@ export class PanelLayoutManager implements AppModule {
       if (dropIndicator) dropIndicator.remove();
       isDragging = false;
       dragStarted = false;
+      originalRect = null;
       el.classList.remove('dragging-source');
     });
   }

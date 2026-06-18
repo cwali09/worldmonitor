@@ -12,6 +12,8 @@ export {
   REFRESH_INTERVALS,
   MONITOR_COLORS,
   STORAGE_KEYS,
+  DEFAULT_MAP_MODE,
+  type MapModePreference,
 } from './variants/base';
 
 // Market data (shared)
@@ -48,6 +50,7 @@ export {
   getEffectivePanelConfig,
   isPanelInVariantDefaults,
   isPanelEntitled,
+  enforceFreePanelLimit,
   FREE_MAX_PANELS,
   FREE_MAX_SOURCES,
 } from './panels';

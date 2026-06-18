@@ -40,6 +40,7 @@ export const REFRESH_INTERVALS = {
   fearGreed: 30 * 60 * 1000,
   strategicPosture: 15 * 60 * 1000,
   strategicRisk: 5 * 60 * 1000,
+  healthFreshness: 60 * 1000,
   temporalBaseline: 10 * 60 * 1000,
   tradePolicy: 60 * 60 * 1000,
   supplyChain: 60 * 60 * 1000,
@@ -108,6 +109,9 @@ export const STORAGE_KEYS = {
   activeChannel: 'worldmonitor-active-channel',
   webcamPrefs: 'worldmonitor-webcam-prefs',
 } as const;
+
+export type MapModePreference = 'flat' | 'globe';
+export const DEFAULT_MAP_MODE: MapModePreference = 'flat';
 
 // Type definitions for variant configs
 export interface VariantConfig {

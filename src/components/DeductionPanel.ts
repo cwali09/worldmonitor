@@ -2,7 +2,7 @@ import { Panel } from './Panel';
 import { getRpcBaseUrl } from '@/services/rpc-client';
 import { premiumFetch } from '@/services/premium-fetch';
 import { IntelligenceServiceClient } from '@/generated/client/worldmonitor/intelligence/v1/service_client';
-import { h, replaceChildren } from '@/utils/dom-utils';
+import { h, replaceChildren, setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import type { NewsItem, DeductContextDetail } from '@/types';
@@ -10,6 +10,7 @@ import { buildNewsContext } from '@/utils/news-context';
 import { getActiveFrameworkForPanel } from '@/services/analysis-framework-store';
 import { hasPremiumAccess } from '@/services/panel-gating';
 import { FrameworkSelector } from './FrameworkSelector';
+import { extractDeductionProbability } from './deduction-probability';
 
 // deduct-situation + list-market-implications are premium-gated.
 const client = new IntelligenceServiceClient(getRpcBaseUrl(), { fetch: premiumFetch });
@@ -156,7 +157,7 @@ export class DeductionPanel extends Panel {
             if (group.cls === 'ds-primary') {
                 const headingNode = group.nodes[0];
                 const fullText = headingNode?.textContent ?? '';
-                const probMatch = /(\d{1,3})\s*%/.exec(fullText);
+                const probability = extractDeductionProbability(fullText);
                 const timeMatch = /\(([^)]+)\)/.exec(fullText);
                 labelEl.textContent = group.label;
                 if (timeMatch) {
@@ -165,10 +166,11 @@ export class DeductionPanel extends Panel {
                     timeSpan.textContent = timeMatch[1] ?? '';
                     labelEl.appendChild(timeSpan);
                 }
-                if (probMatch) {
+                if (probability) {
                     const badge = document.createElement('span');
                     badge.className = 'ds-prob-badge';
-                    badge.textContent = `${probMatch[1]}%`;
+                    badge.textContent = probability.label;
+                    badge.title = probability.isRange ? 'Rough probability range from the source' : 'Approximate probability from the source';
                     labelEl.appendChild(badge);
                 }
             } else {
@@ -184,7 +186,10 @@ export class DeductionPanel extends Panel {
                 clone.querySelector('strong')?.remove();
                 const bodyDiv = document.createElement('div');
                 bodyDiv.className = group.cls === 'ds-primary' ? 'ds-primary-body' : '';
-                bodyDiv.innerHTML = clone.innerHTML.replace(/^[\s:–—-]+/, '');
+                setTrustedHtml(
+                    bodyDiv,
+                    trustedHtml(clone.innerHTML.replace(/^[\s:–—-]+/, ''), 'legacy direct innerHTML migration'),
+                );
                 section.appendChild(bodyDiv);
             } else {
                 // For alt paths: inject probability badges into li items
@@ -192,12 +197,13 @@ export class DeductionPanel extends Panel {
                     bodyNodes.forEach(n => {
                         if (n.tagName === 'UL') {
                             n.querySelectorAll('li').forEach(li => {
-                                const probMatch = /^(\d{1,3})\s*%\s*[:\s]?(.*)/.exec(li.textContent ?? '');
-                                if (probMatch) {
+                                const probability = extractDeductionProbability(li.textContent ?? '', { leadingOnly: true });
+                                if (probability) {
                                     const badge = document.createElement('span');
                                     badge.className = 'ds-alt-prob';
-                                    badge.textContent = `${probMatch[1]}%`;
-                                    li.textContent = (probMatch[2] ?? '').replace(/^\s*[:\s]+/, '').trim();
+                                    badge.textContent = probability.label;
+                                    badge.title = probability.isRange ? 'Rough probability range from the source' : 'Approximate probability from the source';
+                                    li.textContent = probability.remainder;
                                     li.insertBefore(badge, li.firstChild);
                                 }
                             });
@@ -235,7 +241,13 @@ export class DeductionPanel extends Panel {
         this.submitBtn.disabled = true;
 
         this.resultContainer.className = 'deduction-result loading';
-        this.resultContainer.innerHTML = '<div class="deduction-loading-dots"><span></span><span></span><span></span></div>Analyzing…';
+        setTrustedHtml(
+            this.resultContainer,
+            trustedHtml(
+                '<div class="deduction-loading-dots"><span></span><span></span><span></span></div>Analyzing…',
+                'legacy direct innerHTML migration',
+            ),
+        );
 
         try {
             const resp = await client.deductSituation({
@@ -250,7 +262,7 @@ export class DeductionPanel extends Panel {
                 const parsed = await marked.parse(resp.analysis);
                 if (!this.element?.isConnected) return;
                 const safe = DOMPurify.sanitize(parsed);
-                this.resultContainer.innerHTML = safe;
+                setTrustedHtml(this.resultContainer, trustedHtml(safe, 'legacy direct innerHTML migration'));
                 this.reformatResult(this.resultContainer);
             } else {
                 this.resultContainer.textContent = resp.provider === 'error'

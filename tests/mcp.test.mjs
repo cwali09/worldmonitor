@@ -1,11 +1,21 @@
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import { strict as assert } from 'node:assert';
+import {
+  BASE_URL,
+  HMAC_SECRET,
+  PRO_USER_ID,
+  PRO_TOKEN_ID,
+  PRO_BEARER,
+  makePipelineMock,
+  makeProDeps,
+  proReq,
+  callBody,
+} from './helpers/mcp-pro-deps.mjs';
 
 const originalFetch = globalThis.fetch;
 const originalEnv = { ...process.env };
 
 const VALID_KEY = 'wm_test_key_123';
-const BASE_URL = 'https://worldmonitor.app/mcp';
 
 function makeReq(method = 'POST', body = null, headers = {}) {
   return new Request(BASE_URL, {
@@ -124,6 +134,40 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     assert.equal(body.error?.code, -32600);
   });
 
+  // --- logging/setLevel ---
+
+  it('logging/setLevel with valid level returns success', async () => {
+    for (const level of ['debug', 'info', 'notice', 'warning', 'error', 'critical', 'alert', 'emergency']) {
+      const res = await handler(makeReq('POST', {
+        jsonrpc: '2.0', id: 10, method: 'logging/setLevel',
+        params: { level },
+      }));
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.deepStrictEqual(body.result, {}, `level "${level}" must return empty success result`);
+      assert.equal(body.error, undefined, `level "${level}" must not return an error`);
+    }
+  });
+
+  it('logging/setLevel with invalid level returns JSON-RPC -32602', async () => {
+    for (const bad of ['trace', 'warn', 'CRITICAL', 'Info', '', 42, null, undefined]) {
+      const res = await handler(makeReq('POST', {
+        jsonrpc: '2.0', id: 11, method: 'logging/setLevel',
+        params: { level: bad },
+      }));
+      const body = await res.json();
+      assert.equal(body.error?.code, -32602, `level ${JSON.stringify(bad)} must be rejected with -32602`);
+    }
+  });
+
+  it('initialize response advertises logging capability', async () => {
+    const res = await handler(makeReq('POST', initBody(12)));
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(body.result?.capabilities?.logging, 'capabilities.logging must be present');
+    assert.deepStrictEqual(body.result.capabilities.logging, {}, 'capabilities.logging must be an empty object');
+  });
+
   // --- tools/list ---
 
   it('tools/list returns 39 tools with name, description, inputSchema', async () => {
@@ -141,6 +185,7 @@ describe('api/mcp.ts — PRO MCP Server', () => {
       assert.ok(!('_coverageKeys' in tool), 'Internal _coverageKeys must not be exposed in tools/list');
       assert.ok(!('_apiPaths' in tool), 'Internal _apiPaths must not be exposed in tools/list (Tier-4 parity)');
       assert.ok(!('_postFilter' in tool), 'Internal _postFilter must not be exposed in tools/list (issue #3677)');
+      assert.ok(!('_outputBudgetBytes' in tool), 'Internal _outputBudgetBytes must not be exposed in tools/list (PR-B)');
     }
     const toolNames = body.result.tools.map((t) => t.name);
     assert.ok(toolNames.includes('get_displacement_data'), 'get_displacement_data must be registered (U1 Tier 1 regression)');
@@ -220,6 +265,32 @@ describe('api/mcp.ts — PRO MCP Server', () => {
 
     assert.equal(freshness.stale, false);
     assert.equal(freshness.cached_at, new Date(now - 24 * 60 * 60_000).toISOString());
+  });
+
+  it('evaluateFreshness marks below-floor recordCount stale even when fetchedAt is fresh', () => {
+    const now = Date.UTC(2026, 5, 11, 12, 0, 0);
+    const freshness = evaluateFreshness(
+      [
+        { key: 'seed-meta:supply_chain:portwatch-ports', maxStaleMin: 2160, minRecordCount: 174 },
+      ],
+      [
+        { fetchedAt: now - 12 * 60 * 60_000, recordCount: 139 },
+      ],
+      now,
+    );
+
+    assert.equal(freshness.stale, true);
+    assert.equal(freshness.cached_at, new Date(now - 12 * 60 * 60_000).toISOString());
+  });
+
+  it('get_chokepoint_status declares the PortWatch 174-country freshness floor', async () => {
+    const { CACHE_TOOLS } = await import(`../api/mcp/registry/cache-tools.ts?t=${Date.now()}`);
+    const tool = CACHE_TOOLS.find((candidate) => candidate.name === 'get_chokepoint_status');
+    const portwatchFreshness = tool?._freshnessChecks?.find(
+      (check) => check.key === 'seed-meta:supply_chain:portwatch-ports',
+    );
+
+    assert.equal(portwatchFreshness?.minRecordCount, 174);
   });
 
   // --- Rate limiting ---
@@ -533,6 +604,119 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     assert.ok(ev.bytes_post_jmespath > 0, 'bytes_post_jmespath must reflect the projected size (> 0)');
   });
 
+  // --- Budget (PR-B: outputBudgetBytes) ---
+
+  it('budget: tools/call within budget returns normal response', async () => {
+    // Small payload well within the 128 KB cache-tool budget
+    const stocks = { quotes: [{ symbol: 'AAPL', price: 100 }] };
+    mockCacheKeys(
+      { 'market:stocks-bootstrap:v1': stocks, 'market:crypto:v1': { quotes: [] } },
+      { 'seed-meta:market:stocks': { fetchedAt: Date.now() - 60_000, recordCount: 1 } },
+    );
+    const out = await callTool('get_market_data', {});
+    assert.ok(out.data, 'normal response must contain data');
+    assert.equal(out._budget_exceeded, undefined, 'within-budget response must not contain _budget_exceeded');
+  });
+
+  it('budget: tools/call exceeding budget returns _budget_exceeded envelope', async () => {
+    // Generate a payload that exceeds the 128 KB cache-tool budget.
+    // Each quote entry is ~80 bytes; 3000 entries ≈ 240 KB in the stocks
+    // slice alone, comfortably above 128 KB after JSON serialisation.
+    // Pass limit: 0 to bypass the DEFAULT_LIST_LIMIT (30) cap.
+    const hugeQuotes = Array.from({ length: 3000 }, (_, i) => ({
+      symbol: `SYM${String(i).padStart(4, '0')}`,
+      price: i + 1,
+      change: 0.01 * i,
+      volume: 1000000 + i,
+    }));
+    mockCacheKeys(
+      { 'market:stocks-bootstrap:v1': { quotes: hugeQuotes }, 'market:crypto:v1': { quotes: [] } },
+      { 'seed-meta:market:stocks': { fetchedAt: Date.now() - 60_000, recordCount: hugeQuotes.length } },
+    );
+    const out = await callTool('get_market_data', { limit: 0 });
+    assert.equal(out._budget_exceeded, true, 'oversized response must return _budget_exceeded envelope');
+    assert.equal(typeof out.budget_bytes, 'number', 'envelope must include budget_bytes');
+    assert.equal(typeof out.actual_bytes, 'number', 'envelope must include actual_bytes');
+    assert.ok(out.actual_bytes > out.budget_bytes, 'actual_bytes must exceed budget_bytes');
+    assert.equal(typeof out.hint, 'string', 'envelope must include a hint string');
+  });
+
+  it('budget: telemetry includes budget_exceeded field', async () => {
+    process.env.MCP_TELEMETRY = 'true';
+    const captured = [];
+    const origLog = console.log;
+    console.log = (line) => captured.push(line);
+
+    // Small payload — within budget
+    mockCacheKeys(
+      { 'market:stocks-bootstrap:v1': { quotes: [{ symbol: 'AAPL', price: 100 }] }, 'market:crypto:v1': { quotes: [] } },
+      { 'seed-meta:market:stocks': { fetchedAt: Date.now() - 60_000, recordCount: 1 } },
+    );
+    const res = await handler(makeReq('POST', {
+      jsonrpc: '2.0', id: 800, method: 'tools/call',
+      params: { name: 'get_market_data', arguments: {} },
+    }));
+    console.log = origLog;
+    assert.equal(res.status, 200);
+
+    const tc = captured.filter((l) => l && typeof l === 'object' && !Array.isArray(l) && l.tag === 'mcp.toolcall');
+    assert.equal(tc.length, 1, `expected exactly one mcp.toolcall line, got ${tc.length}`);
+    assert.equal(tc[0].budget_exceeded, false, 'within-budget call must emit budget_exceeded: false');
+  });
+
+  it('budget: telemetry emits budget_exceeded=true when budget is exceeded', async () => {
+    process.env.MCP_TELEMETRY = 'true';
+    process.env.UPSTASH_REDIS_REST_URL = 'https://fake.upstash.io';
+    process.env.UPSTASH_REDIS_REST_TOKEN = 'fake_token';
+    const captured = [];
+    const origLog = console.log;
+    console.log = (line) => captured.push(line);
+
+    // Large payload that exceeds the 128 KB cache-tool budget
+    const hugeQuotes = Array.from({ length: 3000 }, (_, i) => ({
+      symbol: `SYM${String(i).padStart(4, '0')}`,
+      price: i + 1,
+      change: 0.01 * i,
+      volume: 1000000 + i,
+    }));
+    mockCacheKeys(
+      { 'market:stocks-bootstrap:v1': { quotes: hugeQuotes }, 'market:crypto:v1': { quotes: [] } },
+      { 'seed-meta:market:stocks': { fetchedAt: Date.now() - 60_000, recordCount: hugeQuotes.length } },
+    );
+    const freshMod = await import(`../api/mcp.ts?t=${Date.now()}`);
+    const res = await freshMod.default(makeReq('POST', {
+      jsonrpc: '2.0', id: 801, method: 'tools/call',
+      params: { name: 'get_market_data', arguments: { limit: 0 } },
+    }));
+    console.log = origLog;
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    const out = JSON.parse(body.result.content[0].text);
+    assert.equal(out._budget_exceeded, true, 'sanity: response is the budget-exceeded envelope');
+
+    const tc = captured.filter((l) => l && typeof l === 'object' && !Array.isArray(l) && l.tag === 'mcp.toolcall');
+    assert.equal(tc.length, 1, `expected exactly one mcp.toolcall line, got ${tc.length}`);
+    assert.equal(tc[0].budget_exceeded, true, 'over-budget call must emit budget_exceeded: true');
+    assert.equal(tc[0].ok, true, 'budget-exceeded is a successful dispatch, not an error');
+  });
+
+  it('budget: every TOOL_REGISTRY entry declares a positive integer _outputBudgetBytes', async () => {
+    const mod = await import(`../api/mcp.ts?t=${Date.now()}`);
+    const registry = mod.__testing__.TOOL_REGISTRY;
+    assert.ok(Array.isArray(registry) && registry.length > 0, 'TOOL_REGISTRY must be a non-empty array');
+    for (const tool of registry) {
+      assert.equal(
+        typeof tool._outputBudgetBytes,
+        'number',
+        `tool "${tool.name}" must declare _outputBudgetBytes as a number`,
+      );
+      assert.ok(
+        Number.isInteger(tool._outputBudgetBytes) && tool._outputBudgetBytes > 0,
+        `tool "${tool.name}" must declare a positive integer _outputBudgetBytes (got ${tool._outputBudgetBytes})`,
+      );
+    }
+  });
+
   it('get_market_data: symbols filter narrows quote arrays across asset slices', async () => {
     const stocks = { quotes: [{ symbol: 'AAPL', price: 100 }, { symbol: 'MSFT', price: 200 }] };
     const crypto = { quotes: [{ symbol: 'BTC', price: 50000 }] };
@@ -724,6 +908,136 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     );
     const out = await callTool('get_conflict_events', { limit: 0 });
     assert.equal(out.data['ucdp-events'].events.length, 50, 'limit: 0 must opt out of the default cap and return the full list');
+  });
+
+  // --- limit on country/EU/displacement tools ---
+  //
+  // Five tools — get_country_macro, get_eu_housing_cycle,
+  // get_eu_quarterly_gov_debt, get_eu_industrial_production,
+  // get_displacement_data — return per-country payloads that can exceed the
+  // per-tool output budget on default args. The IMF/Eurostat tools cap their
+  // keyed-object country maps via `capNestedMap`; displacement caps arrays.
+  // `limit: 0` is the customer-facing opt-out and always returns the full
+  // payload.
+
+  function makeCountryMap(prefix, n) {
+    return Object.fromEntries(Array.from({ length: n }, (_, i) => [`${prefix}${i}`, { value: i }]));
+  }
+
+  it('limit: get_country_macro default args → caps every IMF dataset to 30', async () => {
+    // Mock all four IMF cache keys with 60 countries each so the test
+    // actually verifies the `for (const label of ['macro','growth','labor',
+    // 'external'])` capNestedMap loop, not just the macro label.
+    const payload = { countries: makeCountryMap('C', 60) };
+    const meta = {
+      'seed-meta:economic:imf-macro': { fetchedAt: Date.now() - 60_000, recordCount: 60 },
+      'seed-meta:economic:imf-growth': { fetchedAt: Date.now() - 60_000, recordCount: 60 },
+      'seed-meta:economic:imf-labor': { fetchedAt: Date.now() - 60_000, recordCount: 60 },
+      'seed-meta:economic:imf-external': { fetchedAt: Date.now() - 60_000, recordCount: 60 },
+    };
+    mockCacheKeys({
+      'economic:imf:macro:v2': payload,
+      'economic:imf:growth:v1': payload,
+      'economic:imf:labor:v1': payload,
+      'economic:imf:external:v1': payload,
+    }, meta);
+    const out = await callTool('get_country_macro', {});
+    for (const label of ['macro', 'growth', 'labor', 'external']) {
+      assert.equal(Object.keys(out.data[label].countries).length, 30,
+        `default args → ${label}.countries capped to DEFAULT_LIST_LIMIT (30)`);
+    }
+  });
+
+  it('limit: get_country_macro countries+limit → countries filter wins, limit ignored', async () => {
+    // Design choice pinned: when countries[] is provided, the early-return
+    // path takes effect and `limit` is silently a no-op. Schema description
+    // says "when no countries filter is supplied" — this regression test
+    // pins that contract so a future "should limit further-narrow a
+    // countries result" rewrite trips the test instead of breaking callers.
+    const payload = { countries: makeCountryMap('C', 60) };
+    const meta = {
+      'seed-meta:economic:imf-macro': { fetchedAt: Date.now() - 60_000, recordCount: 60 },
+      'seed-meta:economic:imf-growth': { fetchedAt: Date.now() - 60_000, recordCount: 0 },
+      'seed-meta:economic:imf-labor': { fetchedAt: Date.now() - 60_000, recordCount: 0 },
+      'seed-meta:economic:imf-external': { fetchedAt: Date.now() - 60_000, recordCount: 0 },
+    };
+    mockCacheKeys({ 'economic:imf:macro:v2': payload }, meta);
+    const out = await callTool('get_country_macro', { countries: ['C0', 'C1', 'C2', 'C3', 'C4'], limit: 1 });
+    assert.equal(Object.keys(out.data.macro.countries).length, 5,
+      'countries filter takes precedence; limit is ignored when countries is supplied');
+  });
+
+  it('limit: get_country_macro limit:0 → full payload', async () => {
+    const macro = { countries: makeCountryMap('C', 60) };
+    const meta = {
+      'seed-meta:economic:imf-macro': { fetchedAt: Date.now() - 60_000, recordCount: 60 },
+      'seed-meta:economic:imf-growth': { fetchedAt: Date.now() - 60_000, recordCount: 0 },
+      'seed-meta:economic:imf-labor': { fetchedAt: Date.now() - 60_000, recordCount: 0 },
+      'seed-meta:economic:imf-external': { fetchedAt: Date.now() - 60_000, recordCount: 0 },
+    };
+    mockCacheKeys({ 'economic:imf:macro:v2': macro }, meta);
+    const out = await callTool('get_country_macro', { limit: 0 });
+    assert.equal(Object.keys(out.data.macro.countries).length, 60,
+      'limit: 0 is the customer-facing opt-out and returns the full payload');
+  });
+
+  it('limit: get_eu_housing_cycle default args → cap to 30, limit:0 → full', async () => {
+    const hp = { countries: makeCountryMap('EU', 40) };
+    const meta = { 'seed-meta:economic:eurostat-house-prices': { fetchedAt: Date.now() - 60_000, recordCount: 40 } };
+
+    mockCacheKeys({ 'economic:eurostat:house-prices:v1': hp }, meta);
+    const capped = await callTool('get_eu_housing_cycle', {});
+    assert.equal(Object.keys(capped.data['house-prices'].countries).length, 30, 'default args → cap to 30');
+
+    mockCacheKeys({ 'economic:eurostat:house-prices:v1': hp }, meta);
+    const optOut = await callTool('get_eu_housing_cycle', { limit: 0 });
+    assert.equal(Object.keys(optOut.data['house-prices'].countries).length, 40, 'limit: 0 → full payload');
+  });
+
+  it('limit: get_eu_quarterly_gov_debt default args → cap to 30, limit:0 → full', async () => {
+    const gd = { countries: makeCountryMap('EU', 40) };
+    const meta = { 'seed-meta:economic:eurostat-gov-debt-q': { fetchedAt: Date.now() - 60_000, recordCount: 40 } };
+
+    mockCacheKeys({ 'economic:eurostat:gov-debt-q:v1': gd }, meta);
+    const capped = await callTool('get_eu_quarterly_gov_debt', {});
+    assert.equal(Object.keys(capped.data['gov-debt-q'].countries).length, 30, 'default args → cap to 30');
+
+    mockCacheKeys({ 'economic:eurostat:gov-debt-q:v1': gd }, meta);
+    const optOut = await callTool('get_eu_quarterly_gov_debt', { limit: 0 });
+    assert.equal(Object.keys(optOut.data['gov-debt-q'].countries).length, 40, 'limit: 0 → full payload');
+  });
+
+  it('limit: get_eu_industrial_production default args → cap to 30, limit:0 → full', async () => {
+    const ip = { countries: makeCountryMap('EU', 40) };
+    const meta = { 'seed-meta:economic:eurostat-industrial-production': { fetchedAt: Date.now() - 60_000, recordCount: 40 } };
+
+    mockCacheKeys({ 'economic:eurostat:industrial-production:v1': ip }, meta);
+    const capped = await callTool('get_eu_industrial_production', {});
+    assert.equal(Object.keys(capped.data['industrial-production'].countries).length, 30, 'default args → cap to 30');
+
+    mockCacheKeys({ 'economic:eurostat:industrial-production:v1': ip }, meta);
+    const optOut = await callTool('get_eu_industrial_production', { limit: 0 });
+    assert.equal(Object.keys(optOut.data['industrial-production'].countries).length, 40, 'limit: 0 → full payload');
+  });
+
+  it('limit: get_displacement_data default args → ≤30 items, limit:0 → full payload', async () => {
+    const currentYear = new Date().getUTCFullYear();
+    const summary = {
+      countries: Array.from({ length: 60 }, (_, i) => ({ iso3: `C${i}`, refugees: i, idps: i })),
+      topFlows: Array.from({ length: 60 }, (_, i) => ({ originCode: `O${i}`, asylumCode: `A${i}`, count: i })),
+    };
+    const dataKey = `displacement:summary:v1:${currentYear}`;
+    const meta = { 'seed-meta:displacement:summary': { fetchedAt: Date.now() - 60_000, recordCount: 60 } };
+
+    mockCacheKeys({ [dataKey]: summary }, meta);
+    const def = await callTool('get_displacement_data', {});
+    assert.equal(def.data.summary.countries.length, 30, 'default args → countries capped to 30');
+    assert.equal(def.data.summary.topFlows.length, 30, 'default args → topFlows capped to 30');
+
+    mockCacheKeys({ [dataKey]: summary }, meta);
+    const full = await callTool('get_displacement_data', { limit: 0 });
+    assert.equal(full.data.summary.countries.length, 60, 'limit: 0 → full countries array');
+    assert.equal(full.data.summary.topFlows.length, 60, 'limit: 0 → full topFlows array');
   });
 
   it('summary mode: collapses arrays to {count, sample} and large entity maps to {count, sample_keys}', async () => {
@@ -1875,16 +2189,28 @@ describe('api/mcp.ts — PRO MCP Server', () => {
   // --- get_maritime_activity ---
 
   it('get_maritime_activity returns zones and disruptions for valid country code', async () => {
+    // Fixture mirrors the REAL wire shape of the generated sebuf handler:
+    // camelCase keys + nested `location` objects. The original fixture used
+    // snake_case (which the wire never produces), so the tool's misread of
+    // density_zones/snapshot_at passed the suite while returning total_zones=0
+    // in production — WORLDMONITOR-T8. Items outside the AE bbox (+3° pad)
+    // must be filtered out tool-side; the inner fetch must carry NO bbox
+    // query (the handler 400s any dimension >10°, and 67 COUNTRY_BBOXES
+    // exceed that).
+    let innerUrl = null;
     globalThis.fetch = async (url) => {
       if (url.toString().includes('/api/maritime/v1/get-vessel-snapshot')) {
+        innerUrl = url.toString();
         return new Response(JSON.stringify({
           snapshot: {
-            snapshot_at: 1711620000000,
-            density_zones: [
-              { name: 'Strait of Hormuz', intensity: 82, ships_per_day: 45, delta_pct: 3.2, note: '' },
+            snapshotAt: 1711620000000,
+            densityZones: [
+              { name: 'Strait of Hormuz', location: { latitude: 26.6, longitude: 56.3 }, intensity: 82, shipsPerDay: 45, deltaPct: 3.2, note: '' },
+              { name: 'Zone 50,4 North Sea', location: { latitude: 51, longitude: 5 }, intensity: 1, shipsPerDay: 114240, deltaPct: 0, note: 'High traffic area' },
             ],
             disruptions: [
-              { name: 'Gulf AIS Gap', type: 'AIS_DISRUPTION_TYPE_GAP_SPIKE', severity: 'AIS_DISRUPTION_SEVERITY_ELEVATED', dark_ships: 3, vessel_count: 12, region: 'Persian Gulf', description: 'Elevated dark-ship activity' },
+              { name: 'Gulf AIS Gap', type: 'AIS_DISRUPTION_TYPE_GAP_SPIKE', severity: 'AIS_DISRUPTION_SEVERITY_ELEVATED', location: { latitude: 25.5, longitude: 54.0 }, darkShips: 3, vesselCount: 12, region: 'Persian Gulf', description: 'Elevated dark-ship activity' },
+              { name: 'Taiwan Strait', type: 'AIS_DISRUPTION_TYPE_CHOKEPOINT_CONGESTION', severity: 'AIS_DISRUPTION_SEVERITY_LOW', location: { latitude: 24.5, longitude: 119.5 }, darkShips: 0, vesselCount: 17, region: 'Taiwan Strait', description: 'Congestion' },
             ],
           },
         }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -1900,11 +2226,101 @@ describe('api/mcp.ts — PRO MCP Server', () => {
     const body = await res.json();
     const data = JSON.parse(body.result.content[0].text);
     assert.equal(data.country_code, 'AE');
-    assert.equal(data.total_zones, 1);
-    assert.equal(data.total_disruptions, 1);
+    assert.ok(innerUrl !== null, 'inner vessel-snapshot fetch must happen');
+    assert.ok(!/sw_lat|ne_lat/.test(innerUrl), 'inner fetch must NOT send a bbox (handler caps at 10°/side)');
+    assert.equal(data.total_zones, 1, 'North Sea zone must be filtered out of AE results');
+    assert.equal(data.total_disruptions, 1, 'Taiwan Strait must be filtered out of AE results');
     assert.equal(data.density_zones[0].name, 'Strait of Hormuz');
+    assert.equal(data.density_zones[0].ships_per_day, 45, 'camelCase wire field must map to snake_case output');
     assert.equal(data.disruptions[0].dark_ships, 3);
+    assert.equal(data.snapshot_at, new Date(1711620000000).toISOString(), 'snapshotAt wire field must populate snapshot_at');
     assert.ok(data.bounding_box?.sw_lat !== undefined, 'bounding_box must be present');
+  });
+
+  it('get_maritime_activity keeps dateline-adjacent results when the pad crosses ±180 (FJ)', async () => {
+    // FJ bbox is [-18.25, 177.34, -16.15, 180]: the +3° pad pushes the east
+    // edge to 183, so a point at -179 sits just across the dateline and MUST
+    // match (it is 1-4° away), while a genuinely distant Pacific point must
+    // not. The original filter only treated sw_lon > ne_lon as wrapped and
+    // silently dropped the -179 point.
+    globalThis.fetch = async (url) => {
+      if (url.toString().includes('/api/maritime/v1/get-vessel-snapshot')) {
+        return new Response(JSON.stringify({
+          snapshot: {
+            snapshotAt: 1711620000000,
+            densityZones: [
+              { name: 'Across the dateline', location: { latitude: -17.5, longitude: -179 }, intensity: 10, shipsPerDay: 20, deltaPct: 0, note: '' },
+              { name: 'West of Fiji in-box', location: { latitude: -17.0, longitude: 178.0 }, intensity: 5, shipsPerDay: 10, deltaPct: 0, note: '' },
+              { name: 'Far Pacific', location: { latitude: -17.5, longitude: -150 }, intensity: 3, shipsPerDay: 5, deltaPct: 0, note: '' },
+            ],
+            disruptions: [],
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return originalFetch(url);
+    };
+
+    const res = await handler(makeReq('POST', {
+      jsonrpc: '2.0', id: 23, method: 'tools/call',
+      params: { name: 'get_maritime_activity', arguments: { country_code: 'FJ' } },
+    }));
+    const body = await res.json();
+    const data = JSON.parse(body.result.content[0].text);
+    const names = data.density_zones.map((z) => z.name).sort();
+    assert.deepEqual(names, ['Across the dateline', 'West of Fiji in-box'], 'dateline-adjacent point must match; far-Pacific point must not');
+  });
+
+  it('get_maritime_activity matches every longitude for full-span bboxes (AQ stored as -180..180)', async () => {
+    globalThis.fetch = async (url) => {
+      if (url.toString().includes('/api/maritime/v1/get-vessel-snapshot')) {
+        return new Response(JSON.stringify({
+          snapshot: {
+            snapshotAt: 1711620000000,
+            densityZones: [
+              { name: 'Drake Passage', location: { latitude: -65, longitude: -62 }, intensity: 4, shipsPerDay: 8, deltaPct: 0, note: '' },
+              { name: 'Ross Sea', location: { latitude: -75, longitude: 175 }, intensity: 1, shipsPerDay: 1, deltaPct: 0, note: '' },
+            ],
+            disruptions: [],
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return originalFetch(url);
+    };
+
+    const res = await handler(makeReq('POST', {
+      jsonrpc: '2.0', id: 24, method: 'tools/call',
+      params: { name: 'get_maritime_activity', arguments: { country_code: 'AQ' } },
+    }));
+    const body = await res.json();
+    const data = JSON.parse(body.result.content[0].text);
+    assert.equal(data.total_zones, 2, 'a full-circle longitude span must not collapse under pad normalization');
+  });
+
+  it('get_maritime_activity works for countries whose bbox exceeds the 10° handler cap (e.g. JP)', async () => {
+    globalThis.fetch = async (url) => {
+      if (url.toString().includes('/api/maritime/v1/get-vessel-snapshot')) {
+        return new Response(JSON.stringify({
+          snapshot: {
+            snapshotAt: 1711620000000,
+            densityZones: [
+              { name: 'Tokyo Bay', location: { latitude: 35.4, longitude: 139.8 }, intensity: 60, shipsPerDay: 500, deltaPct: 1, note: '' },
+            ],
+            disruptions: [],
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return originalFetch(url);
+    };
+
+    const res = await handler(makeReq('POST', {
+      jsonrpc: '2.0', id: 22, method: 'tools/call',
+      params: { name: 'get_maritime_activity', arguments: { country_code: 'JP' } },
+    }));
+    const body = await res.json();
+    assert.equal(body.error, undefined, 'JP (14°×16° bbox) must not error');
+    const data = JSON.parse(body.result.content[0].text);
+    assert.equal(data.total_zones, 1);
+    assert.equal(data.density_zones[0].name, 'Tokyo Bay');
   });
 
   it('get_maritime_activity returns error for unknown country code', async () => {
@@ -1957,88 +2373,9 @@ describe('api/mcp.ts — PRO MCP Server', () => {
 // ===========================================================================
 // U7 — Pro-path: McpAuthContext, INCR-first daily quota, internal-HMAC tool fetches
 // ===========================================================================
-
-const PRO_USER_ID = 'user_pro_xyz';
-const PRO_TOKEN_ID = 'k57mcptokenid';
-const PRO_BEARER = 'pro-bearer-uuid';
-const HMAC_SECRET = 'test-secret-mcp-internal-32-bytes-1234';
-
-/** Create a mock pipeline impl over an in-memory map for the daily counter. */
-function makePipelineMock({ initialCount = 0, throwOnIncr = false, decrFails = false } = {}) {
-  const store = new Map();
-  // Pre-seed via INCR-equivalent so newCount math lines up.
-  if (initialCount > 0) store.set('seed', initialCount);
-  let counter = initialCount;
-  const ops = [];
-  const pipeline = async (commands) => {
-    ops.push(commands);
-    if (throwOnIncr && commands.some((c) => c[0] === 'INCR')) {
-      throw new Error('redis pipeline failed');
-    }
-    if (decrFails && commands.some((c) => c[0] === 'DECR')) {
-      throw new Error('redis decr failed');
-    }
-    const out = [];
-    for (const cmd of commands) {
-      if (cmd[0] === 'INCR') {
-        counter += 1;
-        out.push({ result: counter });
-      } else if (cmd[0] === 'DECR') {
-        counter = Math.max(0, counter - 1);
-        out.push({ result: counter });
-      } else if (cmd[0] === 'EXPIRE') {
-        out.push({ result: 1 });
-      } else {
-        out.push({ result: null });
-      }
-    }
-    return out;
-  };
-  return {
-    pipeline,
-    ops,
-    get count() { return counter; },
-  };
-}
-
-function makeProDeps(overrides = {}) {
-  const pipe = makePipelineMock(overrides.pipelineOpts ?? {});
-  return {
-    deps: {
-      resolveBearerToContext: overrides.resolveBearerToContext ?? (async (token) => {
-        if (token === PRO_BEARER) return { kind: 'pro', userId: PRO_USER_ID, mcpTokenId: PRO_TOKEN_ID };
-        return null;
-      }),
-      validateProMcpToken: overrides.validateProMcpToken ?? (async (id) => {
-        if (id === PRO_TOKEN_ID) return { userId: PRO_USER_ID };
-        return null;
-      }),
-      getEntitlements: overrides.getEntitlements ?? (async () => ({
-        planKey: 'pro',
-        features: { tier: 1, mcpAccess: true },
-        validUntil: Date.now() + 86_400_000,
-      })),
-      redisPipeline: pipe.pipeline,
-    },
-    pipe,
-  };
-}
-
-function proReq(method = 'POST', body = null, headers = {}) {
-  return new Request(BASE_URL, {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${PRO_BEARER}`,
-      ...headers,
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-}
-
-function callBody(toolName, args = {}, id = 100) {
-  return { jsonrpc: '2.0', id, method: 'tools/call', params: { name: toolName, arguments: args } };
-}
+// Pro-path fixtures (PRO_USER_ID, makePipelineMock, makeProDeps, proReq,
+// callBody) live in tests/helpers/mcp-pro-deps.mjs so the concurrent-quota
+// and per-tool contract suites can share them.
 
 describe('api/mcp.ts — U7 Pro-path', () => {
   let mcpHandler;
@@ -2341,7 +2678,7 @@ describe('api/mcp.ts — U7 Pro-path', () => {
     // Sign for digest endpoint.
     const signed = await signInternalMcpRequest({
       method: 'GET',
-      url: 'https://worldmonitor.app/api/news/v1/list-feed-digest?lang=en&variant=geo',
+      url: 'https://worldmonitor.app/api/news/v1/list-feed-digest?lang=en&variant=full',
       body: null,
       userId: PRO_USER_ID,
       secret: HMAC_SECRET,

@@ -48,6 +48,15 @@ export const SOURCE_TYPES: Record<string, SourceType> = {
   'Tagesschau': 'mainstream', 'Der Spiegel': 'mainstream', 'Die Zeit': 'mainstream', 'DW News': 'mainstream',
   'ANSA': 'wire', 'Corriere della Sera': 'mainstream', 'Repubblica': 'mainstream',
   'NOS Nieuws': 'mainstream', 'NRC': 'mainstream', 'De Telegraaf': 'mainstream',
+  // Croatian (HR)
+  'N1 Croatia': 'mainstream', 'Index.hr': 'mainstream', 'Jutarnji list': 'mainstream',
+  'Balkan Insight': 'intel',
+  // Hindi (HI)
+  'BBC Hindi': 'mainstream', 'Aaj Tak': 'mainstream', 'NDTV India': 'mainstream', 'Amar Ujala': 'mainstream',
+  // Hungarian (HU)
+  'Telex': 'mainstream', 'Index.hu': 'mainstream', 'HVG': 'mainstream',
+  '444.hu': 'mainstream', '24.hu': 'mainstream', 'Híradó': 'mainstream',
+  'ATV': 'mainstream', 'Portfolio.hu': 'market',
   'SVT Nyheter': 'mainstream', 'Dagens Nyheter': 'mainstream', 'Svenska Dagbladet': 'mainstream',
   // Brazilian Addition
   'Brasil Paralelo': 'mainstream',
@@ -82,6 +91,8 @@ export const SOURCE_TYPES: Record<string, SourceType> = {
   'Arms Control Assn': 'intel', 'Bulletin of Atomic Scientists': 'intel',
   // Food Security & Regional
   'FAO GIEWS': 'gov', 'EU ISS': 'intel',
+  // Investigative journalism & accountability
+  'OCCRP': 'intel', 'DFRLab': 'intel', 'Lighthouse Reports': 'intel', 'The Sentry': 'intel', 'GITOC': 'intel', 'VSquare': 'intel', 'Correctiv': 'intel',
   // New verified think tanks
   'War on the Rocks': 'intel', 'AEI': 'intel', 'Responsible Statecraft': 'intel',
   'FPRI': 'intel', 'Jamestown': 'intel',
@@ -257,6 +268,22 @@ const FULL_FEEDS: Record<string, Feed[]> = {
     { name: 'TVN24', url: rss('https://tvn24.pl/swiat.xml'), lang: 'pl' },
     { name: 'Polsat News', url: rss('https://www.polsatnews.pl/rss/wszystkie.xml'), lang: 'pl' },
     { name: 'Rzeczpospolita', url: rss('https://www.rp.pl/rss_main'), lang: 'pl' },
+    // Hungarian (HU) — V4 / CEE coverage. Locale-gated for hu users only,
+    // matching the Tagesschau (de) / ANSA (it) / NOS Nieuws (nl) / SVT (sv)
+    // convention. `hu` is registered as a supported locale in src/services/i18n.ts.
+    { name: 'Telex', url: rss('https://telex.hu/rss'), lang: 'hu' },
+    { name: 'Index.hu', url: rss('https://index.hu/24ora/rss'), lang: 'hu' },
+    { name: 'HVG', url: rss('https://hvg.hu/rss'), lang: 'hu' },
+    { name: '444.hu', url: rss('https://444.hu/feed'), lang: 'hu' },
+    { name: '24.hu', url: rss('https://24.hu/feed/'), lang: 'hu' },
+    { name: 'Híradó', url: rss('https://news.google.com/rss/search?q=site:hirado.hu+when:2d&hl=hu&gl=HU&ceid=HU:hu'), lang: 'hu' },
+    { name: 'Portfolio.hu', url: rss('https://portfolio.hu/rss/all.xml'), lang: 'hu' },
+    { name: 'ATV', url: rss('https://www.atv.hu/rss'), lang: 'hu' },
+    // Croatian (HR) — mainstream + investigative
+    { name: 'N1 Croatia', url: rss('https://n1info.hr/feed/'), lang: 'hr' },
+    { name: 'Index.hr', url: rss('https://www.index.hr/rss'), lang: 'hr' },
+    { name: 'Jutarnji list', url: rss('https://www.jutarnji.hr/feed'), lang: 'hr' },
+    { name: 'Balkan Insight', url: rss('https://balkaninsight.com/feed/') },
     // Greek (EL)
     { name: 'Kathimerini', url: rss('https://news.google.com/rss/search?q=site:kathimerini.gr+when:2d&hl=el&gl=GR&ceid=GR:el'), lang: 'el' },
     { name: 'Naftemporiki', url: rss('https://www.naftemporiki.gr/feed/'), lang: 'el' },
@@ -280,7 +307,7 @@ const FULL_FEEDS: Record<string, Feed[]> = {
     { name: 'Al Arabiya', url: { en: rss('https://news.google.com/rss/search?q=site:english.alarabiya.net+when:2d&hl=en-US&gl=US&ceid=US:en'), ar: rss('https://www.alarabiya.net/tools/mrss/?cat=main') } },
     // Arab News and Times of Israel removed — 403 from cloud IPs
     { name: 'Guardian ME', url: rss('https://www.theguardian.com/world/middleeast/rss') },
-    { name: 'BBC Persian', url: rss('http://feeds.bbci.co.uk/persian/tv-and-radio-37434376/rss.xml') },
+    { name: 'BBC Persian', url: rss('https://feeds.bbci.co.uk/persian/rss.xml') },
     { name: 'Iran International', url: rss('https://news.google.com/rss/search?q=site:iranintl.com+when:2d&hl=en-US&gl=US&ceid=US:en') },
     { name: 'Fars News', url: rss('https://news.google.com/rss/search?q=site:farsnews.ir+when:2d&hl=en-US&gl=US&ceid=US:en') },
     { name: 'IRNA', url: rss('https://en.irna.ir/rss') },
@@ -412,6 +439,11 @@ const FULL_FEEDS: Record<string, Feed[]> = {
     { name: 'Indian Express', url: rss('https://indianexpress.com/section/india/feed/') },
     { name: 'NDTV', url: rss('https://feeds.feedburner.com/ndtvnews-top-stories') },
     { name: 'India News Network', url: rss('https://news.google.com/rss/search?q=India+diplomacy+foreign+policy+news&hl=en&gl=US&ceid=US:en') },
+    // Hindi (HI) — mainstream national coverage boosted for Hindi locale users
+    { name: 'BBC Hindi', url: rss('https://feeds.bbci.co.uk/hindi/rss.xml'), lang: 'hi' },
+    { name: 'Aaj Tak', url: rss('https://www.aajtak.in/rssfeeds/?id=home'), lang: 'hi' },
+    { name: 'NDTV India', url: rss('https://feeds.feedburner.com/ndtvkhabar-latest'), lang: 'hi' },
+    { name: 'Amar Ujala', url: rss('https://www.amarujala.com/rss/national.xml'), lang: 'hi' },
     { name: 'CNA', url: rss('https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml') },
     { name: 'MIIT (China)', url: rss('https://news.google.com/rss/search?q=site:miit.gov.cn+when:7d&hl=zh-CN&gl=CN&ceid=CN:zh-Hans'), lang: 'zh' },
     { name: 'MOFCOM (China)', url: rss('https://news.google.com/rss/search?q=site:mofcom.gov.cn+when:7d&hl=zh-CN&gl=CN&ceid=CN:zh-Hans'), lang: 'zh' },
@@ -608,7 +640,7 @@ const TECH_FEEDS: Record<string, Feed[]> = {
     { name: 'Seeking Alpha Tech', url: rss('https://seekingalpha.com/market_currents.xml') },
   ],
   hardware: [
-    { name: "Tom's Hardware", url: rss('https://www.tomshardware.com/feeds/all') },
+    { name: "Tom's Hardware", url: rss('https://www.tomshardware.com/feeds.xml') },
     { name: 'SemiAnalysis', url: rss('https://news.google.com/rss/search?q=site:semianalysis.com+when:7d&hl=en-US&gl=US&ceid=US:en') },
     { name: 'Semiconductor News', url: rss('https://news.google.com/rss/search?q=semiconductor+OR+chip+OR+TSMC+OR+NVIDIA+OR+Intel+when:3d&hl=en-US&gl=US&ceid=US:en') },
   ],
@@ -1069,6 +1101,23 @@ export const INTEL_SOURCES: Feed[] = [
   // Economic & Food Security (Tier 2)
   { name: 'FAO News', url: rss('https://www.fao.org/feeds/fao-newsroom-rss'), type: 'economic' },
   { name: 'FAO GIEWS', url: rss('https://news.google.com/rss/search?q=site:fao.org+GIEWS+food+security+when:30d&hl=en-US&gl=US&ceid=US:en'), type: 'economic' },
+
+  // Investigative Journalism & Accountability
+  // Cross-border corruption & organized crime investigations (Panama Papers, Pandora Papers)
+  { name: 'OCCRP', url: rss('https://www.occrp.org/en/feed'), type: 'investigative' },
+  // Atlantic Council Digital Forensic Research Lab — disinformation/influence operations
+  { name: 'DFRLab', url: rss('https://dfrlab.org/feed/'), type: 'investigative' },
+  // European investigative collective — migration, extremism, accountability
+  { name: 'Lighthouse Reports', url: rss('https://www.lighthousereports.com/feed/'), type: 'investigative' },
+  // Africa-focused: war crimes, illicit finance, sanctions evasion
+  { name: 'The Sentry', url: rss('https://thesentry.org/feed/'), type: 'investigative' },
+  // Global Initiative Against Transnational Organized Crime
+  { name: 'GITOC', url: rss('https://globalinitiative.net/feed/'), type: 'investigative' },
+  // V4/CEE investigative network (OCCRP member)
+  { name: 'VSquare', url: rss('https://vsquare.org/feed/'), type: 'investigative' },
+  // German investigative journalism & fact-checking nonprofit
+  { name: 'Correctiv', url: rss('https://correctiv.org/feed/'), type: 'investigative' },
+
   { name: 'EU ISS', url: rss('https://news.google.com/rss/search?q=site:iss.europa.eu+when:7d&hl=en-US&gl=US&ceid=US:en'), type: 'intl' },
 ];
 
@@ -1076,7 +1125,7 @@ export const INTEL_SOURCES: Feed[] = [
 export const DEFAULT_ENABLED_SOURCES: Record<string, string[]> = {
   politics: ['BBC World', 'Guardian World', 'AP News', 'Reuters World', 'CNN World'],
   us: ['Reuters US', 'NPR News', 'PBS NewsHour', 'ABC News', 'CBS News', 'NBC News', 'Wall Street Journal', 'Politico', 'The Hill'],
-  europe: ['France 24', 'EuroNews', 'Le Monde', 'DW News', 'Tagesschau', 'ANSA', 'NOS Nieuws', 'SVT Nyheter'],
+  europe: ['France 24', 'EuroNews', 'Le Monde', 'DW News', 'Tagesschau', 'ANSA', 'NOS Nieuws', 'SVT Nyheter', 'Balkan Insight'],
   middleeast: ['BBC Middle East', 'Al Jazeera', 'Al Arabiya', 'Guardian ME', 'BBC Persian', 'Iran International', 'IRNA', 'Mehr News', 'Haaretz', 'Jerusalem Post', 'Ynetnews', 'Asharq News', 'The National'],
   africa: ['BBC Africa', 'News24', 'Africanews', 'Jeune Afrique', 'Africa News', 'Premium Times', 'Channels TV', 'Sahel Crisis'],
   latam: ['BBC Latin America', 'Reuters LatAm', 'InSight Crime', 'Mexico News Daily', 'Clarín', 'Primicias', 'Infobae Americas', 'El Universo'],

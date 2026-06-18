@@ -6,8 +6,13 @@ import {
   pearson,
   rankArray,
   detectOutliers,
+  fetchWorldRiskIndex,
   HYPOTHESES,
+  benchmarkCliExitCode,
+  isStrictValidationCli,
   runBenchmark,
+  currentCacheFormulaLocal,
+  currentMethodologyFormulaLocal,
 } from '../scripts/benchmark-resilience-external.mjs';
 
 describe('rankArray', () => {
@@ -131,6 +136,61 @@ describe('HYPOTHESES', () => {
   });
 });
 
+describe('fetchWorldRiskIndex', () => {
+  const originalFetch = globalThis.fetch;
+
+  it('uses the WRI vulnerability component rather than the exposure-dominated composite W score', async () => {
+    globalThis.fetch = async () => new Response([
+      'WRI.Country,ISO3.Code,Year,W,V',
+      'United States,USA,2023,99,12',
+      'United States,USA,2024,98,13',
+      'United Kingdom,GBR,2024,88,22',
+    ].join('\n'));
+    try {
+      const { scores, source } = await fetchWorldRiskIndex();
+      assert.equal(source, 'live');
+      assert.equal(scores.get('US'), 13, 'latest-year V component should be used, not W');
+      assert.equal(scores.get('GB'), 22);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('accepts a dotted WRI.Vulnerability column if HDX renames the short V header', async () => {
+    globalThis.fetch = async () => new Response([
+      'WRI.Country,ISO3.Code,Year,W,WRI.Vulnerability',
+      'United States,USA,2024,98,31',
+      'United Kingdom,GBR,2024,88,24',
+    ].join('\n'));
+    try {
+      const { scores } = await fetchWorldRiskIndex();
+      assert.equal(scores.get('US'), 31);
+      assert.equal(scores.get('GB'), 24);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe('benchmark CLI exit policy', () => {
+  it('does not fail non-strict cron mode for cold-start skips', () => {
+    assert.equal(benchmarkCliExitCode({ skipped: true, reason: 'no-wm-scores' }, false), 0);
+    assert.equal(benchmarkCliExitCode({ skipped: true, reason: 'no-wm-scores' }, true), 1);
+  });
+
+  it('fails completed runs with failed hypotheses even outside strict mode', () => {
+    const result = { hypotheses: [{ index: 'INFORM', pass: true }, { index: 'HDI', pass: false }] };
+    assert.equal(benchmarkCliExitCode(result, false), 1);
+    assert.equal(benchmarkCliExitCode(result, true), 1);
+  });
+
+  it('recognizes explicit strict mode only', () => {
+    assert.equal(isStrictValidationCli(['node', 'script.mjs'], {}), false);
+    assert.equal(isStrictValidationCli(['node', 'script.mjs', '--strict'], {}), true);
+    assert.equal(isStrictValidationCli(['node', 'script.mjs'], { RESILIENCE_VALIDATION_STRICT: '1' }), true);
+  });
+});
+
 describe('runBenchmark (mocked)', () => {
   it('produces correct output shape with mock data', async () => {
     const wmScores = new Map([
@@ -179,6 +239,8 @@ describe('runBenchmark (mocked)', () => {
     });
 
     assert.ok(result.generatedAt > 0, 'missing generatedAt');
+    assert.equal(result._formula, currentCacheFormulaLocal());
+    assert.equal(result.methodologyFormula, currentMethodologyFormulaLocal());
     assert.ok(result.license, 'missing license note');
     assert.equal(result.hypotheses.length, 3, 'expected 3 hypotheses');
     assert.ok(result.correlations.INFORM, 'missing INFORM correlation');

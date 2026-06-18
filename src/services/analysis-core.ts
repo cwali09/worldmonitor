@@ -34,6 +34,7 @@ import {
   findNewsForMarketSymbol,
 } from './entity-extraction';
 import { getEntityIndex } from './entity-index';
+import { effectivePubDateMs } from './feed-date';
 import type { ThreatLevel, EventCategory, ThreatClassification } from '@/types';
 
 const THREAT_PRIORITY: Record<ThreatLevel, number> = {
@@ -81,6 +82,7 @@ function aggregateThreats(
 const TOPIC_BASELINE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const TOPIC_BASELINE_SPIKE_MULTIPLIER = 3;
 const TOPIC_HISTORY_MAX_POINTS = 1000;
+export const MAX_CLUSTER_NEWS_ITEMS = 1000;
 
 interface TopicVelocityPoint {
   timestamp: number;
@@ -218,7 +220,18 @@ export function clusterNewsCore(
 ): ClusteredEventCore[] {
   if (items.length === 0) return [];
 
-  const itemsWithTier: NewsItemWithTier[] = items.map(item => ({
+  const boundedItems = items.length > MAX_CLUSTER_NEWS_ITEMS
+    ? [...items]
+        .sort((a, b) =>
+          effectivePubDateMs(b) - effectivePubDateMs(a)
+          || a.source.localeCompare(b.source)
+          || a.title.localeCompare(b.title)
+          || a.link.localeCompare(b.link)
+        )
+        .slice(0, MAX_CLUSTER_NEWS_ITEMS)
+    : items;
+
+  const itemsWithTier: NewsItemWithTier[] = boundedItems.map(item => ({
     ...item,
     tier: item.tier ?? getSourceTier(item.source),
   }));
@@ -289,7 +302,7 @@ export function clusterNewsCore(
     const sorted = [...cluster].sort((a, b) => {
       const tierDiff = a.tier - b.tier;
       if (tierDiff !== 0) return tierDiff;
-      return b.pubDate.getTime() - a.pubDate.getTime();
+      return effectivePubDateMs(b) - effectivePubDateMs(a);
     });
 
     const primary = sorted[0]!;
@@ -437,7 +450,7 @@ export function detectConvergence(
     if (!event.allItems || event.allItems.length < 3) continue;
 
     const recentItems = event.allItems.filter(
-      item => now - item.pubDate.getTime() < WINDOW_MS
+      item => now - effectivePubDateMs(item) < WINDOW_MS
     );
     if (recentItems.length < 3) continue;
 

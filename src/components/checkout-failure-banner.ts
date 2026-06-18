@@ -9,13 +9,15 @@
  * watches on_hold subscriptions, this one fires on return-URL status.
  */
 
-import * as Sentry from '@sentry/browser';
+import { enqueueSentryCall } from '@/bootstrap/sentry-defer';
 import {
   clearCheckoutAttempt,
   loadCheckoutAttempt,
   startCheckout,
 } from '@/services/checkout';
 import { t } from '@/services/i18n';
+import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+
 
 const BANNER_ID = 'checkout-failure-banner';
 
@@ -30,10 +32,10 @@ const BANNER_ID = 'checkout-failure-banner';
 export function showCheckoutFailureBanner(rawStatus: string): void {
   if (document.getElementById(BANNER_ID)) return;
 
-  Sentry.captureMessage('Dodo checkout declined', {
+  enqueueSentryCall((s) => s.captureMessage('Dodo checkout declined', {
     level: 'warning',
     tags: { component: 'dodo-checkout', status: rawStatus },
-  });
+  }));
 
   const banner = document.createElement('div');
   banner.id = BANNER_ID;
@@ -64,7 +66,7 @@ export function showCheckoutFailureBanner(rawStatus: string): void {
     ? `<button id="cf-retry-btn" style="background:#fff;color:#dc2626;border:none;border-radius:4px;padding:4px 12px;font-weight:600;font-size:12px;cursor:pointer;white-space:nowrap;">${t('components.checkoutFailureBanner.retry')}</button>`
     : '';
 
-  banner.innerHTML = `
+  setTrustedHtml(banner, trustedHtml(`
     <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;" aria-hidden="true">
       <circle cx="12" cy="12" r="10"/>
       <line x1="12" y1="8" x2="12" y2="12"/>
@@ -73,7 +75,7 @@ export function showCheckoutFailureBanner(rawStatus: string): void {
     <span>${t('components.checkoutFailureBanner.message')}</span>
     ${retryButton}
     <button id="cf-dismiss-btn" aria-label="${t('components.checkoutFailureBanner.dismiss')}" style="background:transparent;color:#fff;border:none;cursor:pointer;font-size:18px;padding:0 4px;line-height:1;">&times;</button>
-  `;
+  `, "legacy direct innerHTML migration"));
 
   document.body.appendChild(banner);
 
