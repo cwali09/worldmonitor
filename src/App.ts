@@ -12,6 +12,7 @@ import {
   VARIANT_DEFAULTS,
   getEffectivePanelConfig,
   enforceFreePanelLimit,
+  restoreFreeMapPanelAccess,
   FREE_MAX_PANELS,
   FREE_MAX_SOURCES,
 } from '@/config';
@@ -127,6 +128,7 @@ import {
 import type { CorrelationPanel } from '@/components/CorrelationPanel';
 
 const CYBER_LAYER_ENABLED = import.meta.env.VITE_ENABLE_CYBER_LAYER === 'true';
+const FREE_MAP_PANEL_ACCESS_KEY = 'worldmonitor-free-map-panel-access-v1';
 
 export type { CountryBriefSignals } from '@/app/app-context';
 
@@ -1439,9 +1441,17 @@ export class App {
     // the dashboard-tab add/switch/load paths stay in lockstep (same cw-* and
     // count rules). isPro is false here — the isProUser() early-return above
     // already short-circuited pro users.
-    const panelSettings = loadFromStorage<Record<string, PanelConfig>>(STORAGE_KEYS.panels, {});
-    const clampedPanels = enforceFreePanelLimit(panelSettings, false);
+    let panelSettings = loadFromStorage<Record<string, PanelConfig>>(STORAGE_KEYS.panels, {});
     let panelsChanged = false;
+    if (!localStorage.getItem(FREE_MAP_PANEL_ACCESS_KEY)) {
+      const restoredPanels = restoreFreeMapPanelAccess(panelSettings);
+      if (panelSettings.map?.enabled !== restoredPanels.map?.enabled) {
+        panelSettings = restoredPanels;
+        panelsChanged = true;
+      }
+      localStorage.setItem(FREE_MAP_PANEL_ACCESS_KEY, 'done');
+    }
+    const clampedPanels = enforceFreePanelLimit(panelSettings, false);
     for (const key of Object.keys(panelSettings)) {
       if (panelSettings[key]?.enabled !== clampedPanels[key]?.enabled) {
         panelsChanged = true;
@@ -1450,6 +1460,7 @@ export class App {
     }
     if (panelsChanged) {
       saveToStorage(STORAGE_KEYS.panels, clampedPanels);
+      this.state.panelSettings = clampedPanels;
       console.log(`[App] Free tier: enforced ${FREE_MAX_PANELS}-panel limit (disabled over-cap / cw-* panels)`);
     }
 
